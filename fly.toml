@@ -1,0 +1,26 @@
+# Fly.io config — create the app with `fly launch --no-deploy` and let this
+# file take over, or `fly apps create sw-rpg-bot` then `fly deploy`.
+
+app = "sw-rpg-bot"
+primary_region = "fra"  # Frankfurt — closest to DE
+
+[build]
+
+[env]
+  DATA_DIR = "/data"
+
+[mounts]
+  source = "sw_rpg_data"
+  destination = "/data"
+
+# Discord bots don't expose an HTTP service — no [[services]] block.
+# We run a single machine, always on.
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"
+
+[deploy]
+  strategy = "immediate"
+
+[metrics]

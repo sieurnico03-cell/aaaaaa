@@ -1,0 +1,5 @@
+discord.py>=2.5.0
+audioop-lts; python_version >= "3.13"
+python-dotenv>=1.0.1
+anthropic>=0.39.0
+aiosqlite>=0.20.0

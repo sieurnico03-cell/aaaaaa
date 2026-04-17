@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+data/*.csv
+data/battle.db
+.git/
+.idea/
+.vscode/
+scripts/
