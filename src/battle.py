@@ -1,8 +1,11 @@
 """Battle state manager — persistent, one active battle per Discord channel.
 
 Data model (SQLite):
-  battles      : one row per channel with battle metadata
-  fleets       : fleet stack entries (ship class + count + current HP per ship)
+  fleets       : per-fleet ship stacks. A "fleet" is identified by a NAME
+                 (typically a Tupperbox persona display name), scoped per guild.
+  battles      : one row per channel with the two participating fleet names
+                 plus the anchor_message_id (Discord message id from which the
+                 next `/battle resolve` will start reading chat history).
 
 A "stack" represents N identical ships in a fleet. Every ship in the stack
 shares the same max HP, but the currently-damaged ship tracks its shields
@@ -23,19 +26,11 @@ DATA_DIR = Path(os.environ.get("DATA_DIR", _DEFAULT_DATA_DIR))
 DB_PATH = DATA_DIR / "battle.db"
 
 SCHEMA = """
-CREATE TABLE IF NOT EXISTS battles (
-    channel_id    INTEGER PRIMARY KEY,
-    player_a_id   INTEGER NOT NULL,
-    player_b_id   INTEGER NOT NULL,      -- 0 until the opponent joins
-    phase         TEXT NOT NULL DEFAULT 'idle',
-    round_number  INTEGER NOT NULL DEFAULT 0,
-    created_at    INTEGER NOT NULL
-);
-
 CREATE TABLE IF NOT EXISTS fleets (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    owner_id        INTEGER NOT NULL,
-    scope_channel   INTEGER,          -- NULL = persistent player fleet; else battle-scoped
+    guild_id        INTEGER NOT NULL,
+    fleet_name      TEXT NOT NULL,
+    scope_channel   INTEGER,          -- NULL = persistent fleet; else battle-scoped snapshot
     ship_name       TEXT NOT NULL,
     count           INTEGER NOT NULL,
     count_destroyed INTEGER NOT NULL DEFAULT 0,
@@ -43,27 +38,33 @@ CREATE TABLE IF NOT EXISTS fleets (
     hull_current    INTEGER NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS round_posts (
-    channel_id    INTEGER NOT NULL,
-    user_id       INTEGER NOT NULL,
-    post_text     TEXT NOT NULL,
-    PRIMARY KEY (channel_id, user_id)
+CREATE TABLE IF NOT EXISTS battles (
+    channel_id         INTEGER PRIMARY KEY,
+    guild_id           INTEGER NOT NULL,
+    fleet_a_name       TEXT NOT NULL,
+    fleet_b_name       TEXT NOT NULL,
+    anchor_message_id  INTEGER NOT NULL,   -- fixed start-of-battle boundary
+    resolve_cursor_id  INTEGER NOT NULL,   -- advances on each damage resolve
+    phase              TEXT NOT NULL DEFAULT 'active',
+    round_number       INTEGER NOT NULL DEFAULT 0,
+    created_at         INTEGER NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_fleets_owner    ON fleets(owner_id, scope_channel);
-CREATE INDEX IF NOT EXISTS idx_fleets_channel  ON fleets(scope_channel);
+CREATE INDEX IF NOT EXISTS idx_fleets_lookup ON fleets(guild_id, fleet_name, scope_channel);
+CREATE INDEX IF NOT EXISTS idx_fleets_scope  ON fleets(scope_channel);
 """
 
 
 @dataclass
 class FleetStack:
     id: int
-    owner_id: int
+    fleet_name: str
+    guild_id: int
     ship: Ship
-    count: int                 # remaining ships in the stack (not yet destroyed)
+    count: int
     count_destroyed: int
-    shields_current: int       # shields of the lead (currently damaged) ship
-    hull_current: int          # hull of the lead ship
+    shields_current: int
+    hull_current: int
 
     @property
     def is_alive(self) -> bool:
@@ -73,73 +74,112 @@ class FleetStack:
 @dataclass
 class Battle:
     channel_id: int
-    player_a_id: int
-    player_b_id: int
-    phase: str          # 'idle' | 'awaiting_posts' | 'ready_to_resolve'
+    guild_id: int
+    fleet_a_name: str
+    fleet_b_name: str
+    anchor_message_id: int
+    resolve_cursor_id: int
+    phase: str
     round_number: int
+
+
+async def _has_legacy_schema(db: aiosqlite.Connection) -> bool:
+    """Detect schemas from the previous data model (owner-id / round_posts)."""
+    cur = await db.execute("PRAGMA table_info(fleets)")
+    cols = [row[1] for row in await cur.fetchall()]
+    if cols and "owner_id" in cols:
+        return True
+    cur = await db.execute("PRAGMA table_info(battles)")
+    cols = [row[1] for row in await cur.fetchall()]
+    if cols and ("player_a_id" in cols or "player_b_id" in cols):
+        return True
+    return False
 
 
 async def init_db() -> None:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     async with aiosqlite.connect(DB_PATH) as db:
+        if await _has_legacy_schema(db):
+            await db.executescript(
+                "DROP TABLE IF EXISTS round_posts;"
+                "DROP TABLE IF EXISTS battles;"
+                "DROP TABLE IF EXISTS fleets;"
+            )
+            await db.commit()
         await db.executescript(SCHEMA)
+        # Migrate: add resolve_cursor_id to existing battles tables if missing.
+        cur = await db.execute("PRAGMA table_info(battles)")
+        cols = [row[1] for row in await cur.fetchall()]
+        if cols and "resolve_cursor_id" not in cols:
+            await db.execute("ALTER TABLE battles ADD COLUMN resolve_cursor_id INTEGER")
+            await db.execute(
+                "UPDATE battles SET resolve_cursor_id = anchor_message_id "
+                "WHERE resolve_cursor_id IS NULL"
+            )
         await db.commit()
 
 
 # --- Fleet operations --------------------------------------------------------
 
-async def add_ships(owner_id: int, ship_name: str, count: int, *, channel_id: int | None = None) -> FleetStack:
-    """Add a stack of ships to a player's fleet. Merges with existing stacks
-    of the same class in the same scope.
-    """
+async def add_ships(
+    guild_id: int,
+    fleet_name: str,
+    ship_name: str,
+    count: int,
+    *,
+    channel_id: int | None = None,
+) -> FleetStack:
     ship = SHIPS.get(ship_name)
     if ship is None:
         raise ValueError(f"Unknown ship class: {ship_name}")
     if count <= 0:
         raise ValueError("Count must be positive")
+    if not fleet_name.strip():
+        raise ValueError("Fleet name must not be empty")
 
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         row = await (await db.execute(
             """SELECT * FROM fleets
-               WHERE owner_id = ? AND ship_name = ?
+               WHERE guild_id = ? AND fleet_name = ? AND ship_name = ?
                  AND (scope_channel IS ? OR scope_channel = ?)""",
-            (owner_id, ship.name, channel_id, channel_id),
+            (guild_id, fleet_name, ship.name, channel_id, channel_id),
         )).fetchone()
 
         if row is None:
             cur = await db.execute(
                 """INSERT INTO fleets
-                   (owner_id, scope_channel, ship_name, count,
+                   (guild_id, fleet_name, scope_channel, ship_name, count,
                     count_destroyed, shields_current, hull_current)
-                   VALUES (?, ?, ?, ?, 0, ?, ?)""",
-                (owner_id, channel_id, ship.name, count, ship.shields, ship.hull),
+                   VALUES (?, ?, ?, ?, ?, 0, ?, ?)""",
+                (guild_id, fleet_name, channel_id, ship.name, count, ship.shields, ship.hull),
             )
             fleet_id = cur.lastrowid
             await db.commit()
             return FleetStack(
-                id=fleet_id, owner_id=owner_id, ship=ship,
+                id=fleet_id, fleet_name=fleet_name, guild_id=guild_id, ship=ship,
                 count=count, count_destroyed=0,
                 shields_current=ship.shields, hull_current=ship.hull,
             )
 
         new_count = row["count"] + count
-        await db.execute(
-            "UPDATE fleets SET count = ? WHERE id = ?",
-            (new_count, row["id"]),
-        )
+        await db.execute("UPDATE fleets SET count = ? WHERE id = ?", (new_count, row["id"]))
         await db.commit()
         return FleetStack(
-            id=row["id"], owner_id=owner_id, ship=ship,
+            id=row["id"], fleet_name=fleet_name, guild_id=guild_id, ship=ship,
             count=new_count, count_destroyed=row["count_destroyed"],
             shields_current=row["shields_current"], hull_current=row["hull_current"],
         )
 
 
-async def remove_ships(owner_id: int, ship_name: str, count: int, *, channel_id: int | None = None) -> int:
-    """Remove up to *count* ships from a stack. Returns how many were removed.
-    0 if the stack doesn't exist.
-    """
+async def remove_ships(
+    guild_id: int,
+    fleet_name: str,
+    ship_name: str,
+    count: int,
+    *,
+    channel_id: int | None = None,
+) -> int:
     ship = SHIPS.get(ship_name)
     if ship is None:
         raise ValueError(f"Unknown ship class: {ship_name}")
@@ -148,9 +188,9 @@ async def remove_ships(owner_id: int, ship_name: str, count: int, *, channel_id:
         db.row_factory = aiosqlite.Row
         row = await (await db.execute(
             """SELECT * FROM fleets
-               WHERE owner_id = ? AND ship_name = ?
+               WHERE guild_id = ? AND fleet_name = ? AND ship_name = ?
                  AND (scope_channel IS ? OR scope_channel = ?)""",
-            (owner_id, ship.name, channel_id, channel_id),
+            (guild_id, fleet_name, ship.name, channel_id, channel_id),
         )).fetchone()
         if row is None:
             return 0
@@ -164,25 +204,37 @@ async def remove_ships(owner_id: int, ship_name: str, count: int, *, channel_id:
         return removed
 
 
-async def clear_fleet(owner_id: int, *, channel_id: int | None = None) -> int:
+async def clear_fleet(
+    guild_id: int,
+    fleet_name: str,
+    *,
+    channel_id: int | None = None,
+) -> int:
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
             """DELETE FROM fleets
-               WHERE owner_id = ? AND (scope_channel IS ? OR scope_channel = ?)""",
-            (owner_id, channel_id, channel_id),
+               WHERE guild_id = ? AND fleet_name = ?
+                 AND (scope_channel IS ? OR scope_channel = ?)""",
+            (guild_id, fleet_name, channel_id, channel_id),
         )
         await db.commit()
         return cur.rowcount
 
 
-async def get_fleet(owner_id: int, *, channel_id: int | None = None) -> list[FleetStack]:
+async def get_fleet(
+    guild_id: int,
+    fleet_name: str,
+    *,
+    channel_id: int | None = None,
+) -> list[FleetStack]:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         rows = await (await db.execute(
             """SELECT * FROM fleets
-               WHERE owner_id = ? AND (scope_channel IS ? OR scope_channel = ?)
+               WHERE guild_id = ? AND fleet_name = ?
+                 AND (scope_channel IS ? OR scope_channel = ?)
                ORDER BY id""",
-            (owner_id, channel_id, channel_id),
+            (guild_id, fleet_name, channel_id, channel_id),
         )).fetchall()
 
     stacks: list[FleetStack] = []
@@ -191,15 +243,26 @@ async def get_fleet(owner_id: int, *, channel_id: int | None = None) -> list[Fle
         if ship is None:
             continue
         stacks.append(FleetStack(
-            id=row["id"], owner_id=row["owner_id"], ship=ship,
-            count=row["count"], count_destroyed=row["count_destroyed"],
+            id=row["id"], fleet_name=row["fleet_name"], guild_id=row["guild_id"],
+            ship=ship, count=row["count"], count_destroyed=row["count_destroyed"],
             shields_current=row["shields_current"], hull_current=row["hull_current"],
         ))
     return stacks
 
 
+async def list_fleet_names(guild_id: int) -> list[str]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        rows = await (await db.execute(
+            """SELECT DISTINCT fleet_name FROM fleets
+               WHERE guild_id = ? AND scope_channel IS NULL
+               ORDER BY fleet_name""",
+            (guild_id,),
+        )).fetchall()
+    return [r["fleet_name"] for r in rows]
+
+
 async def update_stack(stack: FleetStack) -> None:
-    """Persist the current state of a stack after damage has been applied."""
     async with aiosqlite.connect(DB_PATH) as db:
         if stack.count <= 0:
             await db.execute("DELETE FROM fleets WHERE id = ?", (stack.id,))
@@ -230,102 +293,79 @@ async def get_battle(channel_id: int) -> Battle | None:
         return None
     return Battle(
         channel_id=row["channel_id"],
-        player_a_id=row["player_a_id"],
-        player_b_id=row["player_b_id"],
+        guild_id=row["guild_id"],
+        fleet_a_name=row["fleet_a_name"],
+        fleet_b_name=row["fleet_b_name"],
+        anchor_message_id=row["anchor_message_id"],
+        resolve_cursor_id=row["resolve_cursor_id"] or row["anchor_message_id"],
         phase=row["phase"],
         round_number=row["round_number"],
     )
 
 
-async def _snapshot_fleet(player_id: int, channel_id: int) -> None:
-    """Copy a player's persistent fleet into a battle-scoped snapshot."""
-    persistent = await get_fleet(player_id, channel_id=None)
-    await clear_fleet(player_id, channel_id=channel_id)
+async def _snapshot_fleet(guild_id: int, fleet_name: str, channel_id: int) -> None:
+    persistent = await get_fleet(guild_id, fleet_name, channel_id=None)
+    await clear_fleet(guild_id, fleet_name, channel_id=channel_id)
     async with aiosqlite.connect(DB_PATH) as db:
         for stack in persistent:
             await db.execute(
                 """INSERT INTO fleets
-                   (owner_id, scope_channel, ship_name, count, count_destroyed,
+                   (guild_id, fleet_name, scope_channel, ship_name, count, count_destroyed,
                     shields_current, hull_current)
-                   VALUES (?, ?, ?, ?, 0, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, 0, ?, ?)""",
                 (
-                    player_id, channel_id, stack.ship.name, stack.count,
+                    guild_id, fleet_name, channel_id, stack.ship.name, stack.count,
                     stack.ship.shields, stack.ship.hull,
                 ),
             )
         await db.commit()
 
 
-async def create_battle(channel_id: int, player_a: int, player_b: int = 0) -> Battle:
-    """Create a new battle. If *player_b* is 0, the battle waits for a join."""
+async def create_battle(
+    channel_id: int,
+    guild_id: int,
+    fleet_a_name: str,
+    fleet_b_name: str,
+    anchor_message_id: int,
+) -> Battle:
     import time
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             """INSERT OR REPLACE INTO battles
-               (channel_id, player_a_id, player_b_id, phase, round_number, created_at)
-               VALUES (?, ?, ?, 'idle', 0, ?)""",
-            (channel_id, player_a, player_b, int(time.time())),
+               (channel_id, guild_id, fleet_a_name, fleet_b_name,
+                anchor_message_id, resolve_cursor_id,
+                phase, round_number, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, 'active', 0, ?)""",
+            (channel_id, guild_id, fleet_a_name, fleet_b_name,
+             anchor_message_id, anchor_message_id, int(time.time())),
         )
         await db.commit()
 
-    await _snapshot_fleet(player_a, channel_id)
-    if player_b:
-        await _snapshot_fleet(player_b, channel_id)
+    await _snapshot_fleet(guild_id, fleet_a_name, channel_id)
+    await _snapshot_fleet(guild_id, fleet_b_name, channel_id)
 
     return (await get_battle(channel_id))  # type: ignore[return-value]
 
 
-async def join_battle(channel_id: int, player_b: int) -> bool:
-    """Assign *player_b* to a pending battle and snapshot their fleet.
-
-    Returns False if the battle is already full or doesn't exist.
-    """
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            "UPDATE battles SET player_b_id = ? WHERE channel_id = ? AND player_b_id = 0",
-            (player_b, channel_id),
-        )
-        await db.commit()
-        if cur.rowcount == 0:
-            return False
-    await _snapshot_fleet(player_b, channel_id)
-    return True
-
-
-# --- Round post storage ------------------------------------------------------
-
-async def save_round_post(channel_id: int, user_id: int, text: str) -> None:
+async def set_anchor(channel_id: int, message_id: int) -> None:
+    """Redefine the start-of-battle boundary. Also resets the resolve cursor
+    to that same point, since everything before the anchor is ignored anyway."""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            """INSERT INTO round_posts (channel_id, user_id, post_text)
-               VALUES (?, ?, ?)
-               ON CONFLICT(channel_id, user_id) DO UPDATE SET post_text = excluded.post_text""",
-            (channel_id, user_id, text),
+            "UPDATE battles SET anchor_message_id = ?, resolve_cursor_id = ? "
+            "WHERE channel_id = ?",
+            (message_id, message_id, channel_id),
         )
         await db.commit()
 
 
-async def get_round_post(channel_id: int, user_id: int) -> str | None:
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        row = await (await db.execute(
-            "SELECT post_text FROM round_posts WHERE channel_id = ? AND user_id = ?",
-            (channel_id, user_id),
-        )).fetchone()
-    return row["post_text"] if row else None
-
-
-async def clear_round_posts(channel_id: int) -> None:
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("DELETE FROM round_posts WHERE channel_id = ?", (channel_id,))
-        await db.commit()
-
-
-async def set_phase(channel_id: int, phase: str) -> None:
+async def set_resolve_cursor(channel_id: int, message_id: int) -> None:
+    """Advance the cursor that separates already-resolved context from
+    new messages. Does NOT touch the anchor."""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "UPDATE battles SET phase = ? WHERE channel_id = ?",
-            (phase, channel_id),
+            "UPDATE battles SET resolve_cursor_id = ? WHERE channel_id = ?",
+            (message_id, channel_id),
         )
         await db.commit()
 
@@ -347,6 +387,5 @@ async def advance_round(channel_id: int) -> int:
 async def end_battle(channel_id: int) -> None:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("DELETE FROM fleets WHERE scope_channel = ?", (channel_id,))
-        await db.execute("DELETE FROM round_posts WHERE channel_id = ?", (channel_id,))
         await db.execute("DELETE FROM battles WHERE channel_id = ?", (channel_id,))
         await db.commit()

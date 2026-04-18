@@ -2,15 +2,16 @@
 
 Two distinct tasks:
 
-1. analyze_rp_text(post, attacker_fleet, defender_fleet)
-   Parses a player's roleplay post and extracts:
-     - Which enemy ship classes are being targeted (priority order)
-     - A tactical modifier percentage based on tactics described
-       (flanking, ambush, poor positioning, etc.)
+1. analyze_battle_window(transcript, fleet_a, fleet_b, name_a, name_b)
+   Reads a chronological transcript of RP posts (from both personas) and
+   decides, per side:
+     - Whether the fleet actually OPENED FIRE in this window (vs. still
+       maneuvering, approaching, talking).
+     - Which enemy ship classes are targeted (priority order).
+     - A tactical modifier percentage.
 
-2. write_damage_report(attacker_report, defender_report, ...)
-   Produces the in-universe damage report text for the Discord embed,
-   given the raw numerical outcomes.
+2. write_damage_report_text(...)
+   Produces the in-universe damage report narrative for the embed.
 """
 from __future__ import annotations
 
@@ -28,7 +29,7 @@ from .battle import FleetStack
 ANALYSIS_MODEL = "gemini-2.5-flash"
 NARRATIVE_MODEL = "gemini-2.5-flash"
 REQUEST_TIMEOUT_MS = 30_000
-MAX_MODIFIER = 25   # caps both bonus and penalty at +/- 25%
+MAX_MODIFIER = 25
 
 log = logging.getLogger("sw-rpg-bot.ai")
 
@@ -49,10 +50,18 @@ def client() -> genai.Client:
 
 
 @dataclass
-class RPAnalysis:
-    targeted_ships: list[str]   # exact ship class names, in priority order
-    modifier_percent: int       # -25..+25
-    modifier_reason: str        # short German sentence
+class SideAnalysis:
+    fired: bool
+    targeted_ships: list[str]
+    modifier_percent: int
+    modifier_reason: str
+
+
+@dataclass
+class WindowAnalysis:
+    side_a: SideAnalysis
+    side_b: SideAnalysis
+    overall_note: str   # empty if combat resolved normally
 
 
 def _fleet_summary(stacks: list[FleetStack]) -> str:
@@ -63,93 +72,139 @@ def _fleet_summary(stacks: list[FleetStack]) -> str:
     return "\n".join(lines) if lines else "(keine Schiffe)"
 
 
-async def analyze_rp_text(
-    rp_post: str,
-    attacker_fleet: list[FleetStack],
-    defender_fleet: list[FleetStack],
-) -> RPAnalysis:
-    """Extract targets and tactical modifier from a player's RP post."""
+def _fallback(valid_a: list[str], valid_b: list[str], note: str) -> WindowAnalysis:
+    return WindowAnalysis(
+        side_a=SideAnalysis(False, [], 0, "Analyse fehlgeschlagen"),
+        side_b=SideAnalysis(False, [], 0, "Analyse fehlgeschlagen"),
+        overall_note=note,
+    )
 
-    valid_targets = [s.ship.name for s in defender_fleet if s.is_alive]
+
+async def analyze_battle_window(
+    context_transcript: list[tuple[str, str]],   # already-resolved RP, narrative context only
+    new_transcript: list[tuple[str, str]],       # new RP since last resolve, to decide on
+    fleet_a: list[FleetStack],
+    fleet_b: list[FleetStack],
+    name_a: str,
+    name_b: str,
+) -> WindowAnalysis:
+    valid_a = [s.ship.name for s in fleet_a if s.is_alive]
+    valid_b = [s.ship.name for s in fleet_b if s.is_alive]
+
+    def _fmt(tr: list[tuple[str, str]]) -> str:
+        return "\n\n".join(f"[{persona}]: {text.strip()}" for persona, text in tr) or "(kein Beitrag)"
+
+    context_text = _fmt(context_transcript)
+    new_text = _fmt(new_transcript)
 
     system = (
         "Du bist ein Taktikanalyst für ein Star Wars-Weltraumkampf-RPG. "
-        "Du bekommst einen Roleplay-Text eines Spielers und musst daraus ableiten, "
-        "auf WELCHE gegnerischen Schiffsklassen gezielt wird und ob die beschriebene "
-        "Taktik einen Bonus oder Malus rechtfertigt. Antworte IMMER mit einem einzelnen "
-        "JSON-Objekt ohne zusätzlichen Text."
+        "Du bekommst zwei Transkript-Blöcke zweier Parteien "
+        f"(Seite A = '{name_a}', Seite B = '{name_b}') sowie beide Flotten. "
+        "Der VORHERIGE KAMPFVERLAUF ist nur Hintergrund für narrative Kohärenz – er wurde bereits "
+        "abgerechnet und darf NICHT erneut Schaden verursachen. "
+        "Die NEUEN RP-POSTS sind das aktuelle Fenster: entscheide pro Seite, ob DORT tatsächlich "
+        "Feuer eröffnet wurde (nicht nur Manöver, Anflug oder Kommunikation), und falls ja: welche "
+        "Ziele und welcher Taktik-Modifier. "
+        "Antworte IMMER mit einem einzelnen JSON-Objekt ohne zusätzlichen Text."
     )
 
-    user = f"""ROLEPLAY-TEXT DES ANGREIFERS:
+    user = f"""VORHERIGER KAMPFVERLAUF (nur Kontext, bereits abgerechnet):
 \"\"\"
-{rp_post}
+{context_text}
 \"\"\"
 
-EIGENE FLOTTE (Angreifer):
-{_fleet_summary(attacker_fleet)}
+NEUE RP-POSTS (seit letzter Schadensabrechnung — diese bewerten):
+\"\"\"
+{new_text}
+\"\"\"
 
-GEGNERFLOTTE (mögliche Ziele):
-{_fleet_summary(defender_fleet)}
+FLOTTE SEITE A — {name_a}:
+{_fleet_summary(fleet_a)}
 
-Gib ein JSON zurück mit diesem Schema:
+FLOTTE SEITE B — {name_b}:
+{_fleet_summary(fleet_b)}
+
+Antwortschema:
 {{
-  "targeted_ships": ["exakter Schiffsklassen-Name", ...],
-  "modifier_percent": <ganze Zahl zwischen -{MAX_MODIFIER} und +{MAX_MODIFIER}>,
-  "modifier_reason": "ein kurzer deutscher Satz"
+  "side_a": {{
+    "fired": <true|false>,
+    "targeted_ships": ["exakter Schiffsklassen-Name aus Flotte B", ...],
+    "modifier_percent": <ganze Zahl zwischen -{MAX_MODIFIER} und +{MAX_MODIFIER}>,
+    "modifier_reason": "kurzer deutscher Satz"
+  }},
+  "side_b": {{
+    "fired": <true|false>,
+    "targeted_ships": ["exakter Schiffsklassen-Name aus Flotte A", ...],
+    "modifier_percent": <ganze Zahl>,
+    "modifier_reason": "kurzer deutscher Satz"
+  }},
+  "overall_note": "leer, ODER kurzer deutscher Hinweis falls z.B. gar kein Feuergefecht stattfand"
 }}
 
 Regeln:
-- "targeted_ships" MÜSSEN exakt aus der Gegnerflotte stammen (buchstabengetreu, Copy&Paste).
-- Wenn der Text kein konkretes Ziel nennt, wähle das plausibelste Ziel (Flaggschiff / größte Bedrohung).
-- Prioritätenreihenfolge: Hauptziel zuerst.
-- Modifier-Bonus (+) für: Flankenangriff, Ambush, Ausnutzen von Schwachpunkten, gute Formation, überraschendes Manöver.
-- Modifier-Malus (-) für: frontaler Ansturm auf schwere Kapitalschiffe, schlechte Positionierung, vorhersehbare Taktik, Rückzug ohne Deckung.
-- Keine Werte. Nur das JSON."""
+- Deine Entscheidung bezieht sich AUSSCHLIESSLICH auf die NEUEN RP-POSTS. Der vorherige Kampfverlauf dient nur dazu, Kontext/Beziehungen/narrative Linien zu verstehen.
+- "fired" = true nur wenn in den NEUEN Posts klar erkennbar aktiv gefeuert/beschossen wurde. Anflug, Formationsmanöver, Drohungen, Kommunikation, Schildsystemaktivierung allein sind KEIN Feuer.
+- Wenn schon in einem früheren Fenster gefeuert wurde, aber im aktuellen Fenster nur manövriert wird, dann ist "fired" = false für dieses Fenster.
+- Wenn "fired" = false ist, dürfen "targeted_ships" leer und modifier 0 sein.
+- targeted_ships MÜSSEN exakt aus der gegnerischen Flottenliste stammen (Copy&Paste).
+- Wenn gefeuert wird, aber kein konkretes Ziel genannt ist: wähle das plausibelste (Flaggschiff / größte Bedrohung).
+- Modifier-Bonus für: Flankenangriff, Ambush, Schwachpunkt-Ausnutzung, gute Formation, überraschendes Manöver.
+- Modifier-Malus für: frontaler Ansturm auf Kapitalschiffe, schlechte Positionierung, vorhersehbare Taktik.
+- overall_note ist "" wenn beide Seiten gefeuert haben. Falls keine Seite gefeuert hat, schreib dort eine kurze Feststellung wie 'Beide Flotten befinden sich noch im Anflug'.
+"""
 
     t0 = time.perf_counter()
-    response = await client().aio.models.generate_content(
-        model=ANALYSIS_MODEL,
-        contents=user,
-        config=types.GenerateContentConfig(
-            system_instruction=system,
-            response_mime_type="application/json",
-            max_output_tokens=600,
-        ),
-    )
-    log.info("analyze_rp_text: %.2fs (model=%s)", time.perf_counter() - t0, ANALYSIS_MODEL)
+    try:
+        response = await client().aio.models.generate_content(
+            model=ANALYSIS_MODEL,
+            contents=user,
+            config=types.GenerateContentConfig(
+                system_instruction=system,
+                response_mime_type="application/json",
+                max_output_tokens=900,
+            ),
+        )
+    except Exception:
+        log.exception("analyze_battle_window API call failed")
+        raise
+    log.info("analyze_battle_window: %.2fs (model=%s)", time.perf_counter() - t0, ANALYSIS_MODEL)
 
     text = (response.text or "").strip()
 
     try:
         data = json.loads(text)
     except json.JSONDecodeError:
-        return RPAnalysis(targeted_ships=valid_targets, modifier_percent=0,
-                          modifier_reason="Analyse fehlgeschlagen — kein Modifier")
+        log.warning("analyze_battle_window: JSON decode failed; raw=%r", text[:200])
+        return _fallback(valid_a, valid_b, "Analyse-Fehler: KI lieferte ungültiges JSON.")
 
-    raw_targets = data.get("targeted_ships") or []
-    targets = [t for t in raw_targets if isinstance(t, str) and t in valid_targets]
-    if not targets and valid_targets:
-        targets = [valid_targets[0]]
+    def parse_side(block: dict, valid_targets: list[str]) -> SideAnalysis:
+        fired = bool(block.get("fired", False))
+        raw_targets = block.get("targeted_ships") or []
+        targets = [t for t in raw_targets if isinstance(t, str) and t in valid_targets]
+        if fired and not targets and valid_targets:
+            targets = [valid_targets[0]]
+        mod = int(block.get("modifier_percent", 0) or 0)
+        mod = max(-MAX_MODIFIER, min(MAX_MODIFIER, mod))
+        reason = str(block.get("modifier_reason", ""))[:280]
+        return SideAnalysis(fired=fired, targeted_ships=targets,
+                            modifier_percent=mod, modifier_reason=reason)
 
-    mod = int(data.get("modifier_percent", 0))
-    mod = max(-MAX_MODIFIER, min(MAX_MODIFIER, mod))
-    reason = str(data.get("modifier_reason", ""))[:280]
+    side_a = parse_side(data.get("side_a") or {}, valid_b)
+    side_b = parse_side(data.get("side_b") or {}, valid_a)
+    note = str(data.get("overall_note", ""))[:400]
 
-    return RPAnalysis(targeted_ships=targets, modifier_percent=mod, modifier_reason=reason)
+    return WindowAnalysis(side_a=side_a, side_b=side_b, overall_note=note)
 
 
 async def write_damage_report_text(
     attacker_name: str,
     defender_name: str,
-    rp_post_attacker: str,
-    rp_post_defender: str,
     total_damage: int,
     modifier_percent: int,
     modifier_reason: str,
     stack_damages: list,
 ) -> str:
-    """Compose a short in-universe damage report narrative (2-4 sentences)."""
-
     damage_lines = []
     for sd in stack_damages:
         parts = []
