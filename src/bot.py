@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from collections import defaultdict
 
 import discord
@@ -407,11 +408,21 @@ async def round_resolve(inter: discord.Interaction) -> None:
         await inter.followup.send("Eine Flotte ist bereits vernichtet — Kampf ist effektiv vorbei.")
         return
 
-    # Parallel AI analyses
-    analysis_a, analysis_b = await _safe_parallel(
-        ai.analyze_rp_text(post_a.content, fleet_a, fleet_b),
-        ai.analyze_rp_text(post_b.content, fleet_b, fleet_a),
-    )
+    import asyncio
+    t_round = time.perf_counter()
+    try:
+        analysis_a, analysis_b = await asyncio.gather(
+            ai.analyze_rp_text(post_a.content, fleet_a, fleet_b),
+            ai.analyze_rp_text(post_b.content, fleet_b, fleet_a),
+        )
+    except Exception as e:
+        log.exception("Analyse-Phase fehlgeschlagen")
+        await battle.set_phase(b.channel_id, "awaiting_posts")
+        await inter.followup.send(
+            f"⚠ KI-Analyse fehlgeschlagen ({type(e).__name__}). Versucht `/round resolve` erneut."
+        )
+        return
+    log.info("analysis phase total: %.2fs", time.perf_counter() - t_round)
 
     report_a = await _resolve_side(
         attacker_fleet=fleet_a, defender_fleet=fleet_b,
@@ -426,24 +437,32 @@ async def round_resolve(inter: discord.Interaction) -> None:
     name_a = guild.get_member(b.player_a_id).display_name if guild and guild.get_member(b.player_a_id) else "Spieler A"
     name_b = guild.get_member(b.player_b_id).display_name if guild and guild.get_member(b.player_b_id) else "Spieler B"
 
-    narrative_a, narrative_b = await _safe_parallel(
-        ai.write_damage_report_text(
-            attacker_name=name_a, defender_name=name_b,
-            rp_post_attacker=post_a.content, rp_post_defender=post_b.content,
-            total_damage=report_a.total_damage,
-            modifier_percent=report_a.modifier_percent,
-            modifier_reason=report_a.modifier_reason,
-            stack_damages=report_a.stack_damages,
-        ),
-        ai.write_damage_report_text(
-            attacker_name=name_b, defender_name=name_a,
-            rp_post_attacker=post_b.content, rp_post_defender=post_a.content,
-            total_damage=report_b.total_damage,
-            modifier_percent=report_b.modifier_percent,
-            modifier_reason=report_b.modifier_reason,
-            stack_damages=report_b.stack_damages,
-        ),
-    )
+    t_narr = time.perf_counter()
+    try:
+        narrative_a, narrative_b = await asyncio.gather(
+            ai.write_damage_report_text(
+                attacker_name=name_a, defender_name=name_b,
+                rp_post_attacker=post_a.content, rp_post_defender=post_b.content,
+                total_damage=report_a.total_damage,
+                modifier_percent=report_a.modifier_percent,
+                modifier_reason=report_a.modifier_reason,
+                stack_damages=report_a.stack_damages,
+            ),
+            ai.write_damage_report_text(
+                attacker_name=name_b, defender_name=name_a,
+                rp_post_attacker=post_b.content, rp_post_defender=post_a.content,
+                total_damage=report_b.total_damage,
+                modifier_percent=report_b.modifier_percent,
+                modifier_reason=report_b.modifier_reason,
+                stack_damages=report_b.stack_damages,
+            ),
+        )
+    except Exception:
+        log.exception("Narrative-Phase fehlgeschlagen")
+        narrative_a = "_(Funkverbindung zur KI unterbrochen — nur Rohdaten verfügbar.)_"
+        narrative_b = narrative_a
+    log.info("narrative phase total: %.2fs", time.perf_counter() - t_narr)
+    log.info("round_resolve AI total: %.2fs", time.perf_counter() - t_round)
 
     embed_a = _damage_embed(name_a, name_b, report_a, narrative_a)
     embed_b = _damage_embed(name_b, name_a, report_b, narrative_b)
@@ -470,11 +489,6 @@ async def round_resolve(inter: discord.Interaction) -> None:
         )
         await inter.followup.send(embed=end_embed)
         await battle.end_battle(b.channel_id)
-
-
-async def _safe_parallel(*coros):
-    import asyncio
-    return await asyncio.gather(*coros)
 
 
 async def _resolve_side(

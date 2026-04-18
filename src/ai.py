@@ -1,4 +1,4 @@
-"""Claude API integration.
+"""Gemini API integration.
 
 Two distinct tasks:
 
@@ -15,27 +15,36 @@ Two distinct tasks:
 from __future__ import annotations
 
 import json
+import logging
 import os
+import time
 from dataclasses import dataclass
 
-from anthropic import AsyncAnthropic
+from google import genai
+from google.genai import types
 
 from .battle import FleetStack
 
-MODEL = "claude-sonnet-4-6"
+ANALYSIS_MODEL = "gemini-2.5-flash"
+NARRATIVE_MODEL = "gemini-2.5-flash"
+REQUEST_TIMEOUT_MS = 30_000
 MAX_MODIFIER = 25   # caps both bonus and penalty at +/- 25%
 
+log = logging.getLogger("sw-rpg-bot.ai")
 
-_client: AsyncAnthropic | None = None
+_client: genai.Client | None = None
 
 
-def client() -> AsyncAnthropic:
+def client() -> genai.Client:
     global _client
     if _client is None:
-        api_key = os.environ.get("ANTHROPIC_API_KEY")
+        api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
         if not api_key:
-            raise RuntimeError("ANTHROPIC_API_KEY is not set")
-        _client = AsyncAnthropic(api_key=api_key)
+            raise RuntimeError("GEMINI_API_KEY is not set")
+        _client = genai.Client(
+            api_key=api_key,
+            http_options=types.HttpOptions(timeout=REQUEST_TIMEOUT_MS),
+        )
     return _client
 
 
@@ -97,28 +106,26 @@ Regeln:
 - Modifier-Malus (-) für: frontaler Ansturm auf schwere Kapitalschiffe, schlechte Positionierung, vorhersehbare Taktik, Rückzug ohne Deckung.
 - Keine Werte. Nur das JSON."""
 
-    response = await client().messages.create(
-        model=MODEL,
-        max_tokens=600,
-        system=system,
-        messages=[{"role": "user", "content": user}],
+    t0 = time.perf_counter()
+    response = await client().aio.models.generate_content(
+        model=ANALYSIS_MODEL,
+        contents=user,
+        config=types.GenerateContentConfig(
+            system_instruction=system,
+            response_mime_type="application/json",
+            max_output_tokens=600,
+        ),
     )
+    log.info("analyze_rp_text: %.2fs (model=%s)", time.perf_counter() - t0, ANALYSIS_MODEL)
 
-    text = response.content[0].text.strip()
-    # Tolerate ```json fences if the model adds them
-    if text.startswith("```"):
-        text = text.strip("`")
-        if text.lower().startswith("json"):
-            text = text[4:].strip()
+    text = (response.text or "").strip()
 
     try:
         data = json.loads(text)
     except json.JSONDecodeError:
-        # Last-resort fallback: no targets => attack everything proportionally
         return RPAnalysis(targeted_ships=valid_targets, modifier_percent=0,
                           modifier_reason="Analyse fehlgeschlagen — kein Modifier")
 
-    # Sanitize
     raw_targets = data.get("targeted_ships") or []
     targets = [t for t in raw_targets if isinstance(t, str) and t in valid_targets]
     if not targets and valid_targets:
@@ -166,9 +173,11 @@ Getroffene Ziele:
 
 Schreibe nur den Bericht selbst, keine Einleitung, keine Überschriften. Nutze militärischen Funkverkehr-Stil."""
 
-    response = await client().messages.create(
-        model=MODEL,
-        max_tokens=400,
-        messages=[{"role": "user", "content": user}],
+    t0 = time.perf_counter()
+    response = await client().aio.models.generate_content(
+        model=NARRATIVE_MODEL,
+        contents=user,
+        config=types.GenerateContentConfig(max_output_tokens=400),
     )
-    return response.content[0].text.strip()
+    log.info("write_damage_report_text: %.2fs (model=%s)", time.perf_counter() - t0, NARRATIVE_MODEL)
+    return (response.text or "").strip()

@@ -1,14 +1,14 @@
 # SW RPG Discord Bot
 
-Bot für Star-Wars-RPG-Raumschlachten auf Discord. Spieler registrieren Flotten, beschreiben ihre Angriffe im Roleplay, und der Bot berechnet Schilde-, Hüllen- und Schiffsverluste auf Basis der offiziellen Flottentabelle. Taktische Modifier (Flanke, Ambush, Frontalansturm) werden von der Claude-API aus den RP-Texten abgeleitet.
+Bot für Star-Wars-RPG-Raumschlachten auf Discord. Spieler registrieren Flotten, beschreiben ihre Angriffe im Roleplay, und der Bot berechnet Schilde-, Hüllen- und Schiffsverluste auf Basis der offiziellen Flottentabelle. Taktische Modifier (Flanke, Ambush, Frontalansturm) werden von der Gemini-API aus den RP-Texten abgeleitet.
 
 ## Features
 
 - **117 Schiffsklassen** (Republik + CIS) mit SBD, RU, Damage pro Schadensbericht, Jägerkapazität, Bewaffnung, Notizen.
 - **Slash-Commands** für Flotten-Verwaltung, Kampfablauf, Schiffsinfos.
 - **Persistenter Kampfstand** pro Discord-Kanal (SQLite).
-- **Claude-gestützte RP-Analyse:** extrahiert Ziele und Taktik-Modifier aus den Spieler-Posts.
-- **Atmosphärische Schadensberichte** im IC-Stil (ebenfalls Claude-generiert).
+- **Gemini-gestützte RP-Analyse:** extrahiert Ziele und Taktik-Modifier aus den Spieler-Posts.
+- **Atmosphärische Schadensberichte** im IC-Stil (ebenfalls Gemini-generiert).
 
 ## Befehle
 
@@ -40,7 +40,7 @@ pip install -r requirements.txt
 # Config
 copy .env.example .env            # Windows
 # cp .env.example .env            # macOS/Linux
-# .env editieren: DISCORD_BOT_TOKEN + ANTHROPIC_API_KEY
+# .env editieren: DISCORD_BOT_TOKEN + GEMINI_API_KEY
 
 # Schiffsdaten neu bauen (nur wenn die CSVs aktualisiert wurden)
 python scripts/build_ship_data.py
@@ -69,7 +69,7 @@ fly volumes create sw_rpg_data --region fra --size 1   # 1 GB reicht dicke
 
 # Secrets setzen (werden verschlüsselt gespeichert, nie im Code)
 fly secrets set DISCORD_BOT_TOKEN=xxxx
-fly secrets set ANTHROPIC_API_KEY=xxxx
+fly secrets set GEMINI_API_KEY=xxxx
 
 # Deploy
 fly deploy
@@ -125,7 +125,7 @@ sw-rpg-bot/
 ├── scripts/
 │   └── build_ship_data.py  # CSV → ships.json
 ├── src/
-│   ├── ai.py               # Claude-API-Calls
+│   ├── ai.py               # Gemini-API-Calls
 │   ├── battle.py           # Persistenter Kampfstand (SQLite)
 │   ├── bot.py              # Discord-Bot + Slash-Commands
 │   ├── damage.py           # Schadensberechnung
