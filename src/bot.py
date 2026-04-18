@@ -418,8 +418,9 @@ async def round_resolve(inter: discord.Interaction) -> None:
     except Exception as e:
         log.exception("Analyse-Phase fehlgeschlagen")
         await battle.set_phase(b.channel_id, "awaiting_posts")
+        msg = f"{type(e).__name__}: {e}"[:500]
         await inter.followup.send(
-            f"⚠ KI-Analyse fehlgeschlagen ({type(e).__name__}). Versucht `/round resolve` erneut."
+            f"⚠ KI-Analyse fehlgeschlagen.\n```\n{msg}\n```"
         )
         return
     log.info("analysis phase total: %.2fs", time.perf_counter() - t_round)
