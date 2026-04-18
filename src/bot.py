@@ -3,14 +3,16 @@
 Slash commands:
   /ship info <name>
   /ship search <query>
-  /fleet add <ship> <count>
-  /fleet remove <ship> <count>
+  /fleet add <user> <ship> <count>        (admin only)
+  /fleet remove <user> <ship> <count>     (admin only)
   /fleet show [user]
-  /fleet clear
-  /battle start <opponent>
+  /fleet clear <user>                     (admin only)
+  /battle start
+  /battle join
   /battle status
   /battle end
   /round start
+  /round post <text>
   /round resolve
 """
 from __future__ import annotations
@@ -69,7 +71,7 @@ def _fleet_embed(user: discord.abc.User, stacks: list[battle.FleetStack], title_
     if not stacks:
         embed = discord.Embed(
             title=f"Flotte von {user.display_name}{title_suffix}",
-            description="_Leer. Füge Schiffe mit `/fleet add` hinzu._",
+            description="_Leer. Ein Admin kann mit `/fleet add` Schiffe hinzufügen._",
             color=EMBED_COLOR_DEFAULT,
         )
         return embed
@@ -177,44 +179,62 @@ bot.tree.add_command(ship_group)
 fleet_group = app_commands.Group(name="fleet", description="Persönliche Flotte verwalten")
 
 
-@fleet_group.command(name="add", description="Schiffe zur eigenen Flotte hinzufügen")
-@app_commands.describe(ship="Schiffsklasse", count="Anzahl")
+def _is_admin(inter: discord.Interaction) -> bool:
+    perms = getattr(inter.user, "guild_permissions", None)
+    return bool(perms and perms.administrator)
+
+
+@fleet_group.command(name="add", description="Schiffe zur Flotte eines Spielers hinzufügen (nur Admin)")
+@app_commands.describe(user="Spieler, dessen Flotte erweitert wird", ship="Schiffsklasse", count="Anzahl")
 @app_commands.autocomplete(ship=_ship_name_autocomplete)
-async def fleet_add(inter: discord.Interaction, ship: str, count: int) -> None:
+@app_commands.default_permissions(administrator=True)
+async def fleet_add(inter: discord.Interaction, user: discord.Member, ship: str, count: int) -> None:
+    if not _is_admin(inter):
+        await inter.response.send_message("Nur Admins dürfen Flotten verwalten.", ephemeral=True)
+        return
     if count <= 0:
         await inter.response.send_message("Anzahl muss positiv sein.", ephemeral=True)
         return
     try:
-        stack = await battle.add_ships(inter.user.id, ship, count)
+        stack = await battle.add_ships(user.id, ship, count)
     except ValueError as e:
         await inter.response.send_message(f"Fehler: {e}", ephemeral=True)
         return
     await inter.response.send_message(
-        f"✓ {count}× **{stack.ship.name}** hinzugefügt. Stack hat jetzt {stack.count}.",
+        f"✓ {count}× **{stack.ship.name}** zu {user.mention}s Flotte hinzugefügt. "
+        f"Stack hat jetzt {stack.count}.",
         ephemeral=True,
     )
 
 
-@fleet_group.command(name="remove", description="Schiffe aus der eigenen Flotte entfernen")
-@app_commands.describe(ship="Schiffsklasse", count="Anzahl")
+@fleet_group.command(name="remove", description="Schiffe aus der Flotte eines Spielers entfernen (nur Admin)")
+@app_commands.describe(user="Spieler, dessen Flotte reduziert wird", ship="Schiffsklasse", count="Anzahl")
 @app_commands.autocomplete(ship=_ship_name_autocomplete)
-async def fleet_remove(inter: discord.Interaction, ship: str, count: int) -> None:
+@app_commands.default_permissions(administrator=True)
+async def fleet_remove(inter: discord.Interaction, user: discord.Member, ship: str, count: int) -> None:
+    if not _is_admin(inter):
+        await inter.response.send_message("Nur Admins dürfen Flotten verwalten.", ephemeral=True)
+        return
     if count <= 0:
         await inter.response.send_message("Anzahl muss positiv sein.", ephemeral=True)
         return
     try:
-        removed = await battle.remove_ships(inter.user.id, ship, count)
+        removed = await battle.remove_ships(user.id, ship, count)
     except ValueError as e:
         await inter.response.send_message(f"Fehler: {e}", ephemeral=True)
         return
     if removed == 0:
-        await inter.response.send_message("Dieses Schiff ist nicht in deiner Flotte.", ephemeral=True)
+        await inter.response.send_message(
+            f"Dieses Schiff ist nicht in {user.mention}s Flotte.", ephemeral=True,
+        )
     else:
-        await inter.response.send_message(f"✓ {removed}× entfernt.", ephemeral=True)
+        await inter.response.send_message(
+            f"✓ {removed}× aus {user.mention}s Flotte entfernt.", ephemeral=True,
+        )
 
 
-@fleet_group.command(name="show", description="Eigene Flotte (oder die eines anderen Spielers) anzeigen")
-@app_commands.describe(user="Optional: Flotte dieses Spielers anzeigen")
+@fleet_group.command(name="show", description="Flotte eines Spielers anzeigen")
+@app_commands.describe(user="Optional: Flotte dieses Spielers (Standard: eigene)")
 async def fleet_show(inter: discord.Interaction, user: discord.Member | None = None) -> None:
     target = user or inter.user
     stacks = await battle.get_fleet(target.id)
@@ -222,10 +242,17 @@ async def fleet_show(inter: discord.Interaction, user: discord.Member | None = N
     await inter.response.send_message(embed=embed)
 
 
-@fleet_group.command(name="clear", description="Eigene Flotte komplett leeren")
-async def fleet_clear(inter: discord.Interaction) -> None:
-    removed = await battle.clear_fleet(inter.user.id)
-    await inter.response.send_message(f"✓ Flotte gelöscht ({removed} Einträge).", ephemeral=True)
+@fleet_group.command(name="clear", description="Flotte eines Spielers komplett leeren (nur Admin)")
+@app_commands.describe(user="Spieler, dessen Flotte gelöscht wird")
+@app_commands.default_permissions(administrator=True)
+async def fleet_clear(inter: discord.Interaction, user: discord.Member) -> None:
+    if not _is_admin(inter):
+        await inter.response.send_message("Nur Admins dürfen Flotten verwalten.", ephemeral=True)
+        return
+    removed = await battle.clear_fleet(user.id)
+    await inter.response.send_message(
+        f"✓ Flotte von {user.mention} gelöscht ({removed} Einträge).", ephemeral=True,
+    )
 
 
 bot.tree.add_command(fleet_group)
@@ -237,16 +264,8 @@ battle_group = app_commands.Group(name="battle", description="Raumschlacht verwa
 round_group = app_commands.Group(name="round", description="Kampfrunden steuern")
 
 
-@battle_group.command(name="start", description="Raumschlacht in diesem Kanal starten")
-@app_commands.describe(opponent="Gegner")
-async def battle_start(inter: discord.Interaction, opponent: discord.Member) -> None:
-    if opponent.id == inter.user.id:
-        await inter.response.send_message("Du kannst nicht gegen dich selbst kämpfen.", ephemeral=True)
-        return
-    if opponent.bot:
-        await inter.response.send_message("Bots können nicht als Gegner registriert werden.", ephemeral=True)
-        return
-
+@battle_group.command(name="start", description="Raumschlacht in diesem Kanal eröffnen (du bist Spieler A)")
+async def battle_start(inter: discord.Interaction) -> None:
     existing = await battle.get_battle(inter.channel_id)
     if existing is not None:
         await inter.response.send_message(
@@ -256,21 +275,69 @@ async def battle_start(inter: discord.Interaction, opponent: discord.Member) -> 
         return
 
     attacker_fleet = await battle.get_fleet(inter.user.id)
-    defender_fleet = await battle.get_fleet(opponent.id)
-    if not attacker_fleet or not defender_fleet:
+    if not attacker_fleet:
         await inter.response.send_message(
-            "Beide Spieler brauchen eine registrierte Flotte (`/fleet add`) bevor ein Kampf starten kann.",
+            "Du hast keine registrierte Flotte. Bitte einen Admin, dir eine Flotte zuzuweisen.",
             ephemeral=True,
         )
         return
 
-    await battle.create_battle(inter.channel_id, inter.user.id, opponent.id)
+    await battle.create_battle(inter.channel_id, inter.user.id, 0)
 
     embed = discord.Embed(
-        title="⚔ KAMPF INITIIERT",
+        title="Kampf eröffnet",
         description=(
-            f"{inter.user.mention} fordert {opponent.mention} heraus.\n\n"
-            "Nutze `/round start` um die erste Runde zu beginnen."
+            f"{inter.user.mention} hat einen Kampf in diesem Kanal eröffnet.\n\n"
+            "Der zweite Spieler tritt mit `/battle join` bei. Danach startet ihr mit `/round start`."
+        ),
+        color=EMBED_COLOR_DEFAULT,
+    )
+    await inter.response.send_message(embed=embed)
+
+
+@battle_group.command(name="join", description="Einem laufenden Kampf in diesem Kanal beitreten")
+async def battle_join(inter: discord.Interaction) -> None:
+    b = await battle.get_battle(inter.channel_id)
+    if b is None:
+        await inter.response.send_message(
+            "Kein offener Kampf in diesem Kanal. Eröffne einen mit `/battle start`.",
+            ephemeral=True,
+        )
+        return
+    if b.player_b_id != 0:
+        await inter.response.send_message(
+            "Dieser Kampf hat schon beide Teilnehmer.", ephemeral=True,
+        )
+        return
+    if b.player_a_id == inter.user.id:
+        await inter.response.send_message(
+            "Du hast den Kampf selbst eröffnet — der Gegner muss jemand anderes sein.",
+            ephemeral=True,
+        )
+        return
+
+    fleet = await battle.get_fleet(inter.user.id)
+    if not fleet:
+        await inter.response.send_message(
+            "Du hast keine registrierte Flotte. Bitte einen Admin, dir eine Flotte zuzuweisen.",
+            ephemeral=True,
+        )
+        return
+
+    ok = await battle.join_battle(inter.channel_id, inter.user.id)
+    if not ok:
+        await inter.response.send_message("Beitritt nicht möglich — vielleicht ist jemand schneller gewesen.", ephemeral=True)
+        return
+
+    guild = inter.guild
+    p_a = guild.get_member(b.player_a_id) if guild else None
+    a_mention = p_a.mention if p_a else f"<@{b.player_a_id}>"
+
+    embed = discord.Embed(
+        title="Kampfparteien komplett",
+        description=(
+            f"{a_mention} gegen {inter.user.mention}.\n\n"
+            "Startet die erste Runde mit `/round start`."
         ),
         color=EMBED_COLOR_DEFAULT,
     )
@@ -284,18 +351,33 @@ async def battle_status(inter: discord.Interaction) -> None:
         await inter.response.send_message("Kein laufender Kampf in diesem Kanal.", ephemeral=True)
         return
 
+    embed = discord.Embed(
+        title=f"Kampfstand — Runde {b.round_number}",
+        description=f"Phase: `{b.phase}`",
+        color=EMBED_COLOR_DEFAULT,
+    )
+
+    if b.player_b_id == 0:
+        p_a = inter.guild.get_member(b.player_a_id) if inter.guild else None
+        name_a = p_a.display_name if p_a else f"<@{b.player_a_id}>"
+        embed.add_field(
+            name="Status",
+            value=f"{name_a} wartet auf einen Gegner. Beitreten mit `/battle join`.",
+            inline=False,
+        )
+        await inter.response.send_message(embed=embed)
+        return
+
     p_a = inter.guild.get_member(b.player_a_id) if inter.guild else None
     p_b = inter.guild.get_member(b.player_b_id) if inter.guild else None
     stacks_a = await battle.get_fleet(b.player_a_id, channel_id=b.channel_id)
     stacks_b = await battle.get_fleet(b.player_b_id, channel_id=b.channel_id)
 
-    embed = discord.Embed(
-        title=f"⚔ Kampfstand · Runde {b.round_number}",
-        description=f"Phase: `{b.phase}`",
-        color=EMBED_COLOR_DEFAULT,
-    )
-    for player, stacks in ((p_a, stacks_a), (p_b, stacks_b)):
-        name = player.display_name if player else f"Spieler {stacks[0].owner_id if stacks else '?'}"
+    for player, stacks, fallback_id in (
+        (p_a, stacks_a, b.player_a_id),
+        (p_b, stacks_b, b.player_b_id),
+    ):
+        name = player.display_name if player else f"Spieler {fallback_id}"
         if not stacks:
             embed.add_field(name=name, value="_Flotte zerstört_", inline=False)
             continue
@@ -327,10 +409,16 @@ async def round_start(inter: discord.Interaction) -> None:
     if b is None:
         await inter.response.send_message("Kein Kampf aktiv. Erst `/battle start`.", ephemeral=True)
         return
+    if b.player_b_id == 0:
+        await inter.response.send_message(
+            "Der zweite Spieler muss erst `/battle join` ausführen.", ephemeral=True,
+        )
+        return
     if inter.user.id not in (b.player_a_id, b.player_b_id):
         await inter.response.send_message("Nur die Kampfteilnehmer können Runden steuern.", ephemeral=True)
         return
 
+    await battle.clear_round_posts(b.channel_id)
     await battle.set_phase(b.channel_id, "awaiting_posts")
     round_num = b.round_number + 1
     await battle.advance_round(b.channel_id)
@@ -342,26 +430,69 @@ async def round_start(inter: discord.Interaction) -> None:
     b_mention = p_b.mention if p_b else f"<@{b.player_b_id}>"
 
     embed = discord.Embed(
-        title=f"🔔 Runde {round_num} — Gefechtsdarstellung",
+        title=f"Runde {round_num} — Gefechtsdarstellung",
         description=(
-            f"{a_mention} und {b_mention}: Postet jetzt eure RP-Nachrichten für diese Runde.\n"
+            f"{a_mention} und {b_mention}: Reicht eure RP-Nachricht mit `/round post` ein.\n"
             "Beschreibt, **welche gegnerischen Schiffe ihr angreift** und **wie** "
             "(Taktik, Formation, Manöver).\n\n"
-            "Sobald beide gepostet haben → `/round resolve` für den Schadensbericht."
+            "Sobald beide eingereicht haben, führt jemand `/round resolve` aus."
         ),
         color=EMBED_COLOR_DEFAULT,
     )
     await inter.response.send_message(embed=embed)
 
 
-async def _latest_post_since(channel: discord.abc.Messageable, user_id: int, marker_id: int) -> discord.Message | None:
-    """Scan recent channel history for the most recent non-bot message by *user_id*
-    after the message with id *marker_id* (the /round start announcement).
-    """
-    async for msg in channel.history(limit=200, after=discord.Object(id=marker_id), oldest_first=False):
-        if msg.author.id == user_id and not msg.author.bot and msg.content.strip():
-            return msg
-    return None
+@round_group.command(name="post", description="Deine RP-Nachricht für die aktuelle Runde einreichen")
+@app_commands.describe(text="Dein Roleplay-Text für die aktuelle Runde")
+async def round_post(inter: discord.Interaction, text: str) -> None:
+    b = await battle.get_battle(inter.channel_id)
+    if b is None:
+        await inter.response.send_message("Kein Kampf aktiv.", ephemeral=True)
+        return
+    if inter.user.id not in (b.player_a_id, b.player_b_id):
+        await inter.response.send_message(
+            "Nur die Kampfteilnehmer können RP-Posts einreichen.", ephemeral=True,
+        )
+        return
+    if b.phase != "awaiting_posts":
+        await inter.response.send_message(
+            "Aktuell ist keine Runde offen. Starte eine mit `/round start`.", ephemeral=True,
+        )
+        return
+
+    clean = text.strip()
+    if len(clean) < 10:
+        await inter.response.send_message(
+            "Der RP-Text ist zu kurz (mind. 10 Zeichen).", ephemeral=True,
+        )
+        return
+
+    await battle.save_round_post(b.channel_id, inter.user.id, clean)
+
+    other_id = b.player_b_id if inter.user.id == b.player_a_id else b.player_a_id
+    other_post = await battle.get_round_post(b.channel_id, other_id)
+    both_ready = other_post is not None
+
+    guild = inter.guild
+    other_member = guild.get_member(other_id) if guild else None
+    other_mention = other_member.mention if other_member else f"<@{other_id}>"
+
+    embed = discord.Embed(
+        title=f"RP-Post von {inter.user.display_name} registriert",
+        description=clean[:3900],
+        color=EMBED_COLOR_DEFAULT,
+    )
+    if both_ready:
+        embed.set_footer(text="Beide Posts liegen vor — führt jetzt /round resolve aus.")
+    else:
+        embed.set_footer(text=f"Warte noch auf {other_member.display_name if other_member else 'Gegner'}.")
+
+    await inter.response.send_message(embed=embed)
+    if not both_ready and other_member:
+        try:
+            await inter.followup.send(f"{other_mention}, du bist dran — `/round post`.")
+        except Exception:
+            pass
 
 
 @round_group.command(name="resolve", description="Schaden der aktuellen Runde berechnen und Bericht posten")
@@ -379,26 +510,17 @@ async def round_resolve(inter: discord.Interaction) -> None:
 
     await inter.response.defer(thinking=True)
 
-    channel = inter.channel
-    # Find the /round start announcement (most recent bot embed with that title prefix)
-    marker: discord.Message | None = None
-    async for msg in channel.history(limit=100):
-        if msg.author.id == bot.user.id and msg.embeds and msg.embeds[0].title and "Gefechtsdarstellung" in msg.embeds[0].title:
-            marker = msg
-            break
-    if marker is None:
-        await inter.followup.send("Konnte den Rundenstart nicht finden. Starte die Runde mit `/round start`.")
-        return
-
-    post_a = await _latest_post_since(channel, b.player_a_id, marker.id)
-    post_b = await _latest_post_since(channel, b.player_b_id, marker.id)
-    if post_a is None or post_b is None:
+    post_a_text = await battle.get_round_post(b.channel_id, b.player_a_id)
+    post_b_text = await battle.get_round_post(b.channel_id, b.player_b_id)
+    if post_a_text is None or post_b_text is None:
         missing = []
-        if post_a is None:
+        if post_a_text is None:
             missing.append(f"<@{b.player_a_id}>")
-        if post_b is None:
+        if post_b_text is None:
             missing.append(f"<@{b.player_b_id}>")
-        await inter.followup.send(f"Es fehlen noch RP-Nachrichten von: {', '.join(missing)}")
+        await inter.followup.send(
+            f"Es fehlen noch RP-Posts von: {', '.join(missing)} (einreichen mit `/round post`)."
+        )
         return
 
     fleet_a = await battle.get_fleet(b.player_a_id, channel_id=b.channel_id)
@@ -412,12 +534,11 @@ async def round_resolve(inter: discord.Interaction) -> None:
     t_round = time.perf_counter()
     try:
         analysis_a, analysis_b = await asyncio.gather(
-            ai.analyze_rp_text(post_a.content, fleet_a, fleet_b),
-            ai.analyze_rp_text(post_b.content, fleet_b, fleet_a),
+            ai.analyze_rp_text(post_a_text, fleet_a, fleet_b),
+            ai.analyze_rp_text(post_b_text, fleet_b, fleet_a),
         )
     except Exception as e:
         log.exception("Analyse-Phase fehlgeschlagen")
-        await battle.set_phase(b.channel_id, "awaiting_posts")
         msg = f"{type(e).__name__}: {e}"[:500]
         await inter.followup.send(
             f"⚠ KI-Analyse fehlgeschlagen.\n```\n{msg}\n```"
@@ -443,7 +564,7 @@ async def round_resolve(inter: discord.Interaction) -> None:
         narrative_a, narrative_b = await asyncio.gather(
             ai.write_damage_report_text(
                 attacker_name=name_a, defender_name=name_b,
-                rp_post_attacker=post_a.content, rp_post_defender=post_b.content,
+                rp_post_attacker=post_a_text, rp_post_defender=post_b_text,
                 total_damage=report_a.total_damage,
                 modifier_percent=report_a.modifier_percent,
                 modifier_reason=report_a.modifier_reason,
@@ -451,7 +572,7 @@ async def round_resolve(inter: discord.Interaction) -> None:
             ),
             ai.write_damage_report_text(
                 attacker_name=name_b, defender_name=name_a,
-                rp_post_attacker=post_b.content, rp_post_defender=post_a.content,
+                rp_post_attacker=post_b_text, rp_post_defender=post_a_text,
                 total_damage=report_b.total_damage,
                 modifier_percent=report_b.modifier_percent,
                 modifier_reason=report_b.modifier_reason,
@@ -460,20 +581,21 @@ async def round_resolve(inter: discord.Interaction) -> None:
         )
     except Exception:
         log.exception("Narrative-Phase fehlgeschlagen")
-        narrative_a = "_(Funkverbindung zur KI unterbrochen — nur Rohdaten verfügbar.)_"
+        narrative_a = "(Funkverbindung zur KI unterbrochen — nur Rohdaten verfügbar.)"
         narrative_b = narrative_a
     log.info("narrative phase total: %.2fs", time.perf_counter() - t_narr)
     log.info("round_resolve AI total: %.2fs", time.perf_counter() - t_round)
 
-    embed_a = _damage_embed(name_a, name_b, report_a, narrative_a)
-    embed_b = _damage_embed(name_b, name_a, report_b, narrative_b)
+    fleet_a_after = await battle.get_fleet(b.player_a_id, channel_id=b.channel_id)
+    fleet_b_after = await battle.get_fleet(b.player_b_id, channel_id=b.channel_id)
 
+    embed_a = _damage_embed(name_a, name_b, report_a, narrative_a, fleet_b_after)
+    embed_b = _damage_embed(name_b, name_a, report_b, narrative_b, fleet_a_after)
+
+    await battle.clear_round_posts(b.channel_id)
     await battle.set_phase(b.channel_id, "idle")
     await inter.followup.send(embeds=[embed_a, embed_b])
 
-    # Check for end-of-battle
-    fleet_a_after = await battle.get_fleet(b.player_a_id, channel_id=b.channel_id)
-    fleet_b_after = await battle.get_fleet(b.player_b_id, channel_id=b.channel_id)
     alive_a = any(s.is_alive for s in fleet_a_after)
     alive_b = any(s.is_alive for s in fleet_b_after)
     if not alive_a or not alive_b:
@@ -484,7 +606,7 @@ async def round_resolve(inter: discord.Interaction) -> None:
         else:
             winner = None
         end_embed = discord.Embed(
-            title="🏁 KAMPF BEENDET",
+            title="Kampf beendet",
             description=f"Sieger: **{winner}**" if winner else "Beide Flotten vernichtet.",
             color=EMBED_COLOR_DEFAULT,
         )
@@ -532,40 +654,110 @@ async def _resolve_side(
     )
 
 
-def _damage_embed(attacker_name: str, defender_name: str, report: damage.DamageReport, narrative: str) -> discord.Embed:
+def _fmt_int(n: int) -> str:
+    return f"{n:,}".replace(",", ".")
+
+
+def _damage_embed(
+    attacker_name: str,
+    defender_name: str,
+    report: damage.DamageReport,
+    narrative: str,
+    defender_fleet_after: list[battle.FleetStack],
+) -> discord.Embed:
     embed = discord.Embed(
-        title=f"📡 Schadensbericht — Angriff von {attacker_name}",
+        title=f"Schadensbericht — Angriff von {attacker_name} auf {defender_name}",
         description=narrative,
         color=EMBED_COLOR_DEFAULT,
     )
     mod = f"{report.modifier_percent:+d}%"
-    embed.add_field(name="Effektiver Schaden", value=f"**{report.total_damage}** ({mod} · {report.modifier_reason or '—'})", inline=False)
+    embed.add_field(
+        name="Effektiver Schaden",
+        value=(
+            f"Gesamtschaden: **{_fmt_int(report.total_damage)}**\n"
+            f"Taktik-Modifier: {mod} — {report.modifier_reason or '—'}"
+        ),
+        inline=False,
+    )
 
     if not report.stack_damages:
-        embed.add_field(name="Ergebnis", value="Keine Treffer.", inline=False)
+        embed.add_field(name="Ergebnis", value="Keine Treffer — alle Ziele bereits zerstört oder verfehlt.", inline=False)
         return embed
 
+    total_destroyed = 0
+    total_shield_dmg = 0
+    total_hull_dmg = 0
+
     for sd in report.stack_damages:
-        parts = []
+        total_destroyed += sd.ships_destroyed
+        total_shield_dmg += sd.shields_lost
+        total_hull_dmg += sd.hull_lost
+
+        lines: list[str] = []
         if sd.shields_lost:
-            parts.append(f"🛡 -{sd.shields_lost} SBD")
+            lines.append(f"Schildschaden: {_fmt_int(sd.shields_lost)} SBD")
         if sd.hull_lost:
-            parts.append(f"🔧 -{sd.hull_lost} RU")
+            lines.append(f"Hüllenschaden: {_fmt_int(sd.hull_lost)} RU")
         if sd.ships_destroyed:
-            parts.append(f"💥 {sd.ships_destroyed}× zerstört")
-        status = f"Verbleibend: {sd.remaining_count}× · Lead {sd.remaining_shields} SBD / {sd.remaining_hull} RU"
+            lines.append(f"Zerstörte Schiffe: {sd.ships_destroyed}")
+        if not lines:
+            lines.append("Kein nennenswerter Effekt.")
+
+        if sd.remaining_count > 0:
+            lines.append(
+                f"Noch einsatzfähig: **{sd.remaining_count} Schiff"
+                f"{'e' if sd.remaining_count != 1 else ''}** · "
+                f"Lead-Schiff: {_fmt_int(sd.remaining_shields)} SBD / "
+                f"{_fmt_int(sd.remaining_hull)} RU"
+            )
+        else:
+            lines.append("Stack vollständig vernichtet.")
+
         embed.add_field(
-            name=f"→ {sd.ship_name}",
-            value="\n".join([" · ".join(parts) if parts else "Kein Effekt", status]),
+            name=sd.ship_name,
+            value="\n".join(lines),
             inline=False,
         )
 
     if report.unassigned_damage > 0:
         embed.add_field(
             name="Nicht zugewiesener Schaden",
-            value=f"{report.unassigned_damage} (alle Ziele dieser Priorität zerstört)",
+            value=(
+                f"{_fmt_int(report.unassigned_damage)} Schadenspunkte verpufften — "
+                "alle priorisierten Ziele waren bereits zerstört."
+            ),
             inline=False,
         )
+
+    fazit_lines: list[str] = []
+    if total_destroyed == 0 and total_shield_dmg == 0 and total_hull_dmg == 0:
+        fazit_lines.append(f"{attacker_name}s Angriff blieb ohne nennenswerten Effekt.")
+    else:
+        fazit_lines.append(
+            f"{attacker_name} fügt {defender_name} insgesamt "
+            f"{_fmt_int(total_shield_dmg)} SBD Schild- und "
+            f"{_fmt_int(total_hull_dmg)} RU Hüllenschaden zu."
+        )
+        if total_destroyed:
+            fazit_lines.append(
+                f"Dabei werden **{total_destroyed} Schiff{'e' if total_destroyed != 1 else ''}** "
+                f"vollständig vernichtet."
+            )
+
+    remaining_ships = sum(s.count for s in defender_fleet_after if s.is_alive)
+    remaining_classes = sum(1 for s in defender_fleet_after if s.is_alive)
+    if remaining_ships == 0:
+        fazit_lines.append(
+            f"{defender_name}s Flotte ist damit vollständig ausgelöscht."
+        )
+    else:
+        fazit_lines.append(
+            f"{defender_name}s verbleibende Streitmacht: **{remaining_ships} Schiff"
+            f"{'e' if remaining_ships != 1 else ''}** in {remaining_classes} Klasse"
+            f"{'n' if remaining_classes != 1 else ''}."
+        )
+
+    embed.add_field(name="Fazit", value="\n".join(fazit_lines), inline=False)
 
     return embed
 
@@ -588,22 +780,24 @@ async def help_cmd(inter: discord.Interaction) -> None:
         inline=False,
     )
     embed.add_field(
-        name="Flotten-Management",
+        name="Flotten (Admin-only außer show)",
         value=(
-            "`/fleet add <schiff> <anzahl>`\n"
-            "`/fleet remove <schiff> <anzahl>`\n"
-            "`/fleet show [user]`\n"
-            "`/fleet clear`"
+            "`/fleet add <user> <schiff> <anzahl>`\n"
+            "`/fleet remove <user> <schiff> <anzahl>`\n"
+            "`/fleet clear <user>`\n"
+            "`/fleet show [user]`"
         ),
         inline=False,
     )
     embed.add_field(
         name="Raumschlacht",
         value=(
-            "`/battle start <gegner>` — Kampf im Kanal starten\n"
+            "`/battle start` — Kampf eröffnen (du bist Spieler A)\n"
+            "`/battle join` — offenem Kampf als Spieler B beitreten\n"
             "`/battle status` — Aktuellen Kampfstand\n"
             "`/battle end` — Kampf beenden\n"
-            "`/round start` — Neue Runde (beide posten RP)\n"
+            "`/round start` — Neue Runde\n"
+            "`/round post <text>` — eigenen RP-Text einreichen\n"
             "`/round resolve` — Schadensbericht berechnen"
         ),
         inline=False,
