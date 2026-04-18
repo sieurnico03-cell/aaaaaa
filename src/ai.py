@@ -98,14 +98,21 @@ async def analyze_battle_window(
     new_text = _fmt(new_transcript)
 
     system = (
-        "Du bist ein Taktikanalyst für ein Star Wars-Weltraumkampf-RPG. "
+        "Du bist ein Taktikanalyst für ein Star Wars-Weltraumkampf-RPG auf Deutsch. "
         "Du bekommst zwei Transkript-Blöcke zweier Parteien "
         f"(Seite A = '{name_a}', Seite B = '{name_b}') sowie beide Flotten. "
         "Der VORHERIGE KAMPFVERLAUF ist nur Hintergrund für narrative Kohärenz – er wurde bereits "
         "abgerechnet und darf NICHT erneut Schaden verursachen. "
-        "Die NEUEN RP-POSTS sind das aktuelle Fenster: entscheide pro Seite, ob DORT tatsächlich "
-        "Feuer eröffnet wurde (nicht nur Manöver, Anflug oder Kommunikation), und falls ja: welche "
-        "Ziele und welcher Taktik-Modifier. "
+        "Die NEUEN RP-POSTS sind das aktuelle Fenster: entscheide pro Seite, ob dort tatsächlich "
+        "geschossen/angegriffen wird, und falls ja: welche Ziele und welcher Taktik-Modifier. "
+        "Wichtig: Die wörtliche Formulierung 'eröffnet das Feuer' ist NIEMALS erforderlich. "
+        "JEDE konkrete Beschreibung von Waffeneinsatz, Beschuss, Torpedos/Raketen/Bomben im Anflug, "
+        "Treffern, Einschlägen, brechenden Schilden oder detonierenden Rümpfen gilt als aktives Feuer. "
+        "Im deutschen Space-RP werden Angriffe oft im Konjunktiv oder mit Modalverben geschrieben "
+        "('würde feuern', 'soll beschießen', 'wird nutzen', 'konzentriert sich auf', 'greift an'); "
+        "solche Formulierungen ZÄHLEN als aktiver Waffeneinsatz, sobald konkrete Waffensysteme "
+        "konkreten Zielschiffen zugeordnet sind. Lies zwischen den Zeilen — wenn der Post beschreibt, "
+        "wie/wogegen die Flotte kämpft, dann kämpft sie. "
         "Antworte IMMER mit einem einzelnen JSON-Objekt ohne zusätzlichen Text."
     )
 
@@ -144,14 +151,19 @@ Antwortschema:
 
 Regeln:
 - Deine Entscheidung bezieht sich AUSSCHLIESSLICH auf die NEUEN RP-POSTS. Der vorherige Kampfverlauf dient nur dazu, Kontext/Beziehungen/narrative Linien zu verstehen.
-- "fired" = true nur wenn in den NEUEN Posts klar erkennbar aktiv gefeuert/beschossen wurde. Anflug, Formationsmanöver, Drohungen, Kommunikation, Schildsystemaktivierung allein sind KEIN Feuer.
+- "fired" = true, sobald im Text beschrieben wird, dass Waffen eingesetzt werden — z.B. Turbolaser feuern, Torpedos abgeschossen, Geschütze beharken Ziele, Jäger geben Salven ab, Treffer schlagen ein, Schilde brechen unter Beschuss, Trümmer fliegen.
+- Konjunktiv-/Modalformen wie 'würde feuern', 'soll beschießen', 'wird angreifen', 'konzentriert sich auf Schiff X', 'Alle Waffen würden nutzen' ZÄHLEN als aktiver Waffeneinsatz, sobald konkrete Waffen/Schiffe konkreten Zielen zugeordnet sind. Das ist die in deutschem Space-RP übliche Form für laufende Angriffe.
+- Auch Zielzuweisungen wie 'Dreadnought A konzentriert Feuer auf Venator B' oder 'Munificents nutzen Langstreckenwaffen gegen das Flaggschiff' sind Feuer, selbst ohne wörtliches 'schießen/feuern'.
+- "fired" = false nur, wenn die neuen Posts ausschließlich Anflug, Ausweichmanöver, Rückzug/Abflug, Formationswechsel, Funkverkehr, Drohungen ohne Waffeneinsatz, reine Schildhochfahr-Beschreibungen oder Aufklärungsmanöver ohne Waffeneinsatz enthalten.
+- Reine Zielvorgaben/Zielformulierungen ('Ziel: Zerstörung des Führungsschiffs') ohne konkrete Waffenzuordnung sind alleine KEIN Feuer.
+- Wenn eine Seite im aktuellen Fenster nachweislich flieht / zurückzieht / abbricht, ohne zu schießen, dann ist "fired" = false für diese Seite.
 - Wenn schon in einem früheren Fenster gefeuert wurde, aber im aktuellen Fenster nur manövriert wird, dann ist "fired" = false für dieses Fenster.
 - Wenn "fired" = false ist, dürfen "targeted_ships" leer und modifier 0 sein.
 - targeted_ships MÜSSEN exakt aus der gegnerischen Flottenliste stammen (Copy&Paste).
 - Wenn gefeuert wird, aber kein konkretes Ziel genannt ist: wähle das plausibelste (Flaggschiff / größte Bedrohung).
 - Modifier-Bonus für: Flankenangriff, Ambush, Schwachpunkt-Ausnutzung, gute Formation, überraschendes Manöver.
 - Modifier-Malus für: frontaler Ansturm auf Kapitalschiffe, schlechte Positionierung, vorhersehbare Taktik.
-- overall_note ist "" wenn beide Seiten gefeuert haben. Falls keine Seite gefeuert hat, schreib dort eine kurze Feststellung wie 'Beide Flotten befinden sich noch im Anflug'.
+- overall_note ist "" wenn beide Seiten gefeuert haben. Falls keine Seite gefeuert hat, schreib dort eine kurze Feststellung wie 'Beide Flotten befinden sich noch im Anflug' oder 'Angreifer bricht ab und zieht sich zurück'.
 """
 
     t0 = time.perf_counter()
