@@ -43,8 +43,21 @@ log = logging.getLogger("sw-rpg-bot")
 FACTION_COLOR = {
     "Republic": discord.Color.from_rgb(200, 30, 30),
     "CIS":      discord.Color.from_rgb(30, 80, 200),
+    "Republik": discord.Color.from_rgb(200, 30, 30),
+    "KUS":      discord.Color.from_rgb(30, 80, 200),
 }
 EMBED_COLOR_DEFAULT = discord.Color.from_rgb(255, 204, 0)
+
+# Fraktionslabel, wie sie dem Spieler angezeigt werden.
+FACTION_LABEL_LONG = {
+    "Republik": "Galaktische Republik",
+    "KUS":      "Konföderation unabhängiger Systeme",
+}
+# Interne Ship.faction → deutsches Flottenlabel (Fallback, falls Admin keins setzt)
+SHIP_FACTION_TO_FLEET = {
+    "Republic": "Republik",
+    "CIS":      "KUS",
+}
 
 MAX_TRANSCRIPT_MESSAGES = 80   # safety cap for history scan
 
@@ -105,7 +118,11 @@ async def _fleet_name_autocomplete(inter: discord.Interaction, current: str) -> 
     ][:25]
 
 
-def _fleet_embed(fleet_name: str, stacks: list[battle.FleetStack]) -> discord.Embed:
+def _fleet_embed(
+    fleet_name: str,
+    stacks: list[battle.FleetStack],
+    fleet_faction: str | None = None,
+) -> discord.Embed:
     if not stacks:
         return discord.Embed(
             title=f"Flotte: {fleet_name}",
@@ -117,27 +134,28 @@ def _fleet_embed(fleet_name: str, stacks: list[battle.FleetStack]) -> discord.Em
     for s in stacks:
         by_category[s.ship.category].append(s)
 
-    faction = stacks[0].ship.faction
+    color_key = fleet_faction or stacks[0].ship.faction
     embed = discord.Embed(
         title=f"Flotte: {fleet_name}",
-        color=FACTION_COLOR.get(faction, EMBED_COLOR_DEFAULT),
+        color=FACTION_COLOR.get(color_key, EMBED_COLOR_DEFAULT),
     )
 
     total_ships = sum(s.count for s in stacks)
     total_destroyed = sum(s.count_destroyed for s in stacks)
-    embed.description = f"**{total_ships}** aktiv  ·  **{total_destroyed}** verloren"
+    header_lines = [f"**{total_ships}** aktiv  ·  **{total_destroyed}** verloren"]
+    if fleet_faction:
+        header_lines.insert(0, f"Fraktion: **{FACTION_LABEL_LONG.get(fleet_faction, fleet_faction)}**")
+    embed.description = "\n".join(header_lines)
 
     for category, entries in by_category.items():
         lines = []
         for s in entries:
-            status = ""
-            if s.shields_current < s.ship.shields or s.hull_current < s.ship.hull:
-                status = (
-                    f"  _(Lead: {_fmt_int(s.shields_current)}/{_fmt_int(s.ship.shields)} SBD, "
-                    f"{_fmt_int(s.hull_current)}/{_fmt_int(s.ship.hull)} RU)_"
-                )
             destroyed = f" ~~-{s.count_destroyed}~~" if s.count_destroyed else ""
-            lines.append(f"• **{s.count}×** {s.ship.name}{destroyed}{status}")
+            lines.append(
+                f"• **{s.count}×** {s.ship.name}{destroyed} — "
+                f"{_fmt_int(s.shields_current)}/{_fmt_int(s.ship.shields)} SBD · "
+                f"{_fmt_int(s.hull_current)}/{_fmt_int(s.ship.hull)} RU"
+            )
         embed.add_field(name=category, value="\n".join(lines)[:1024], inline=False)
 
     return embed
@@ -176,6 +194,8 @@ async def ship_info(inter: discord.Interaction, name: str) -> None:
         description=f"_{ship.faction} · {ship.category}_",
         color=FACTION_COLOR.get(ship.faction, EMBED_COLOR_DEFAULT),
     )
+    if ship.image_url:
+        embed.set_image(url=ship.image_url)
     embed.add_field(name="Schilde (SBD)", value=f"**{_fmt_int(ship.shields)}**", inline=True)
     embed.add_field(name="Hülle (RU)", value=f"**{_fmt_int(ship.hull)}**", inline=True)
     embed.add_field(name="Damage/Runde", value=f"**{ship.damage_per_report:g}**", inline=True)
@@ -224,10 +244,24 @@ fleet_group = app_commands.Group(name="fleet", description="Flotten verwalten (A
     fleet_name="Name der Flotte (typischerweise der Tupperbox-Persona-Name)",
     ship="Schiffsklasse",
     count="Anzahl",
+    faction=(
+        "Fraktion der Flotte — nur beim ersten Anlegen nötig. "
+        "Wird sonst automatisch aus dem Schiff abgeleitet."
+    ),
 )
+@app_commands.choices(faction=[
+    app_commands.Choice(name="Galaktische Republik", value="Republik"),
+    app_commands.Choice(name="Konföderation unabhängiger Systeme (KUS)", value="KUS"),
+])
 @app_commands.autocomplete(ship=_ship_name_autocomplete, fleet_name=_fleet_name_autocomplete)
 @app_commands.default_permissions(administrator=True)
-async def fleet_add(inter: discord.Interaction, fleet_name: str, ship: str, count: int) -> None:
+async def fleet_add(
+    inter: discord.Interaction,
+    fleet_name: str,
+    ship: str,
+    count: int,
+    faction: app_commands.Choice[str] | None = None,
+) -> None:
     if inter.guild is None:
         await inter.response.send_message("Nur in Servern nutzbar.", ephemeral=True)
         return
@@ -242,9 +276,21 @@ async def fleet_add(inter: discord.Interaction, fleet_name: str, ship: str, coun
     except ValueError as e:
         await inter.response.send_message(f"Fehler: {e}", ephemeral=True)
         return
+
+    faction_value = faction.value if faction else None
+    existing = await battle.get_fleet_faction(inter.guild.id, fleet_name)
+    if faction_value:
+        await battle.set_fleet_faction(inter.guild.id, fleet_name, faction_value)
+    elif existing is None:
+        derived = SHIP_FACTION_TO_FLEET.get(stack.ship.faction)
+        if derived:
+            await battle.set_fleet_faction(inter.guild.id, fleet_name, derived)
+
+    active_faction = faction_value or existing or SHIP_FACTION_TO_FLEET.get(stack.ship.faction)
+    faction_hint = f" · Fraktion: **{FACTION_LABEL_LONG.get(active_faction, active_faction or '—')}**"
     await inter.response.send_message(
         f"✓ {count}× **{stack.ship.name}** zur Flotte **{fleet_name}** hinzugefügt "
-        f"(Stack jetzt {stack.count}).",
+        f"(Stack jetzt {stack.count}).{faction_hint}",
         ephemeral=True,
     )
 
@@ -303,7 +349,8 @@ async def fleet_show(inter: discord.Interaction, fleet_name: str) -> None:
         await inter.response.send_message("Nur in Servern nutzbar.", ephemeral=True)
         return
     stacks = await battle.get_fleet(inter.guild.id, fleet_name)
-    embed = _fleet_embed(fleet_name, stacks)
+    faction = await battle.get_fleet_faction(inter.guild.id, fleet_name)
+    embed = _fleet_embed(fleet_name, stacks, fleet_faction=faction)
     await inter.response.send_message(embed=embed)
 
 
@@ -541,95 +588,121 @@ async def _collect_transcript_split(
     return context, new, last_id
 
 
-def _damage_embed(
-    attacker_name: str,
-    defender_name: str,
-    report: damage.DamageReport,
-    narrative: str,
-    defender_fleet_after: list[battle.FleetStack],
-) -> discord.Embed:
-    embed = discord.Embed(
-        title=f"Schadensbericht — Angriff von {attacker_name} auf {defender_name}",
-        description=narrative,
-        color=EMBED_COLOR_DEFAULT,
-    )
-    mod = f"{report.modifier_percent:+d}%"
-    embed.add_field(
-        name="Effektiver Schaden",
-        value=(
-            f"Gesamtschaden: **{_fmt_int(report.total_damage)}**\n"
-            f"Taktik-Modifier: {mod} — {report.modifier_reason or '—'}"
-        ),
-        inline=False,
-    )
+def _fleet_status_lines(stacks: list[battle.FleetStack]) -> list[str]:
+    """Eine Zeile pro Stack: '• 3× Venator — 2.850/3.250 SBD · 4.800/4.800 RU'.
 
-    if not report.stack_damages:
-        embed.add_field(name="Ergebnis", value="Keine Treffer.", inline=False)
-        return embed
-
-    total_destroyed = 0
-    total_shield_dmg = 0
-    total_hull_dmg = 0
-    for sd in report.stack_damages:
-        total_destroyed += sd.ships_destroyed
-        total_shield_dmg += sd.shields_lost
-        total_hull_dmg += sd.hull_lost
-
-        lines: list[str] = []
-        if sd.shields_lost:
-            lines.append(f"Schildschaden: {_fmt_int(sd.shields_lost)} SBD")
-        if sd.hull_lost:
-            lines.append(f"Hüllenschaden: {_fmt_int(sd.hull_lost)} RU")
-        if sd.ships_destroyed:
-            lines.append(f"Zerstörte Schiffe: {sd.ships_destroyed}")
-        if not lines:
-            lines.append("Kein nennenswerter Effekt.")
-        if sd.remaining_count > 0:
+    Zerstörte Stacks werden mit durchgestrichener Zeile markiert."""
+    lines: list[str] = []
+    for s in stacks:
+        if s.is_alive:
             lines.append(
-                f"Noch einsatzfähig: **{sd.remaining_count} Schiff"
-                f"{'e' if sd.remaining_count != 1 else ''}** · "
-                f"Lead-Schiff: {_fmt_int(sd.remaining_shields)} SBD / "
-                f"{_fmt_int(sd.remaining_hull)} RU"
+                f"• **{s.count}×** {s.ship.name} — "
+                f"{_fmt_int(s.shields_current)}/{_fmt_int(s.ship.shields)} SBD · "
+                f"{_fmt_int(s.hull_current)}/{_fmt_int(s.ship.hull)} RU"
             )
         else:
-            lines.append("Stack vollständig vernichtet.")
+            lines.append(f"• ~~{s.ship.name}~~ — vollständig vernichtet")
+    return lines or ["_(keine Schiffe)_"]
 
-        embed.add_field(name=sd.ship_name, value="\n".join(lines), inline=False)
 
+def _hits_block(report: damage.DamageReport) -> str:
+    """Kompakte Trefferliste für eine Angriffsseite."""
+    if not report.stack_damages:
+        return "_Keine Treffer gelandet._"
+    rows: list[str] = []
+    for sd in report.stack_damages:
+        parts: list[str] = []
+        if sd.shields_lost:
+            parts.append(f"{_fmt_int(sd.shields_lost)} SBD")
+        if sd.hull_lost:
+            parts.append(f"{_fmt_int(sd.hull_lost)} RU")
+        if sd.ships_destroyed:
+            parts.append(
+                f"**{sd.ships_destroyed} zerstört**"
+            )
+        if not parts:
+            parts.append("kein Effekt")
+        rows.append(f"• {sd.ship_name}: {' · '.join(parts)}")
     if report.unassigned_damage > 0:
-        embed.add_field(
-            name="Nicht zugewiesener Schaden",
-            value=(
-                f"{_fmt_int(report.unassigned_damage)} Schadenspunkte verpufften — "
-                "alle priorisierten Ziele waren bereits zerstört."
-            ),
-            inline=False,
+        rows.append(
+            f"_{_fmt_int(report.unassigned_damage)} Schadenspunkte verpufft "
+            "(alle Ziele waren bereits zerstört)_"
         )
+    return "\n".join(rows)
 
-    fazit_lines: list[str] = []
-    fazit_lines.append(
-        f"{attacker_name} fügt {defender_name} insgesamt "
-        f"{_fmt_int(total_shield_dmg)} SBD Schild- und "
-        f"{_fmt_int(total_hull_dmg)} RU Hüllenschaden zu."
+
+def _faction_header(fleet_name: str, faction: str | None) -> str:
+    if faction and faction in FACTION_LABEL_LONG:
+        return f"{FACTION_LABEL_LONG[faction]} · **{fleet_name}**"
+    return f"**{fleet_name}**"
+
+
+def _combined_report_embed(
+    *,
+    round_number: int,
+    scene: str,
+    fleet_a_name: str,
+    fleet_b_name: str,
+    faction_a: str | None,
+    faction_b: str | None,
+    analysis: ai.WindowAnalysis,
+    report_a: damage.DamageReport | None,
+    report_b: damage.DamageReport | None,
+    narrative_a: str,
+    narrative_b: str,
+    fleet_a_after: list[battle.FleetStack],
+    fleet_b_after: list[battle.FleetStack],
+) -> discord.Embed:
+    """Ein einziger Schadensbericht-Embed: Szene, beide Seiten-Aktionen,
+    Treffer und Flottenstatus (aktuell/max pro Schiff)."""
+    embed = discord.Embed(
+        title=f"Schadensbericht — Runde {round_number}",
+        description=(scene or "").strip() or None,
+        color=EMBED_COLOR_DEFAULT,
     )
-    if total_destroyed:
-        fazit_lines.append(
-            f"Dabei werden **{total_destroyed} Schiff"
-            f"{'e' if total_destroyed != 1 else ''}** vollständig vernichtet."
-        )
 
-    remaining_ships = sum(s.count for s in defender_fleet_after if s.is_alive)
-    remaining_classes = sum(1 for s in defender_fleet_after if s.is_alive)
-    if remaining_ships == 0:
-        fazit_lines.append(f"{defender_name}s Flotte ist damit vollständig ausgelöscht.")
-    else:
-        fazit_lines.append(
-            f"{defender_name}s verbleibende Streitmacht: **{remaining_ships} Schiff"
-            f"{'e' if remaining_ships != 1 else ''}** in {remaining_classes} Klasse"
-            f"{'n' if remaining_classes != 1 else ''}."
-        )
+    def _side_block(
+        attacker_name: str,
+        defender_name: str,
+        faction: str | None,
+        side: ai.SideAnalysis,
+        report: damage.DamageReport | None,
+        narrative: str,
+    ) -> tuple[str, str]:
+        header = _faction_header(attacker_name, faction) + f"  →  **{defender_name}**"
+        chunks: list[str] = []
+        if side.fired and report is not None:
+            if narrative:
+                chunks.append(narrative)
+            chunks.append(f"**Gesamtschaden:** {_fmt_int(report.total_damage)}")
+            chunks.append(_hits_block(report))
+        else:
+            if side.action_summary:
+                chunks.append(side.action_summary)
+            chunks.append("_Kein Feuer in diesem Fenster — kein Rückangriff gegen diese Seite._")
+        return header, "\n\n".join(chunks)[:1024]
 
-    embed.add_field(name="Fazit", value="\n".join(fazit_lines), inline=False)
+    header_a, body_a = _side_block(
+        fleet_a_name, fleet_b_name, faction_a, analysis.side_a, report_a, narrative_a,
+    )
+    header_b, body_b = _side_block(
+        fleet_b_name, fleet_a_name, faction_b, analysis.side_b, report_b, narrative_b,
+    )
+    embed.add_field(name=header_a, value=body_a, inline=False)
+    embed.add_field(name=header_b, value=body_b, inline=False)
+
+    # Flottenstatus nach dem Bericht — beide Seiten, je eine Zeile pro Schiffstyp.
+    status_a = "\n".join(_fleet_status_lines(fleet_a_after))[:1024]
+    status_b = "\n".join(_fleet_status_lines(fleet_b_after))[:1024]
+    embed.add_field(
+        name=f"Lagebild · {_faction_header(fleet_a_name, faction_a)}",
+        value=status_a, inline=False,
+    )
+    embed.add_field(
+        name=f"Lagebild · {_faction_header(fleet_b_name, faction_b)}",
+        value=status_b, inline=False,
+    )
+
     return embed
 
 
@@ -639,8 +712,7 @@ async def _resolve_side(
     defender_fleet: list[battle.FleetStack],
     analysis: ai.SideAnalysis,
 ) -> damage.DamageReport:
-    base = damage.compute_outgoing_damage(attacker_fleet)
-    total = damage.apply_modifier(base, analysis.modifier_percent)
+    total = damage.compute_outgoing_damage(attacker_fleet)
 
     target_order: list[battle.FleetStack] = []
     name_to_stack = {s.ship.name: s for s in defender_fleet}
@@ -660,8 +732,6 @@ async def _resolve_side(
     return damage.DamageReport(
         attacker_id=0, defender_id=0,
         total_damage=total,
-        modifier_reason=analysis.modifier_reason,
-        modifier_percent=analysis.modifier_percent,
         stack_damages=stack_damages,
         unassigned_damage=unassigned,
     )
@@ -740,7 +810,7 @@ async def battle_resolve(inter: discord.Interaction) -> None:
             await battle.set_resolve_cursor(b.channel_id, new_cursor)
         return
 
-    await battle.advance_round(b.channel_id)
+    round_number = await battle.advance_round(b.channel_id)
 
     # Compute damage for any side that fired
     report_a: damage.DamageReport | None = None
@@ -750,66 +820,57 @@ async def battle_resolve(inter: discord.Interaction) -> None:
             attacker_fleet=fleet_a, defender_fleet=fleet_b, analysis=analysis.side_a,
         )
     if analysis.side_b.fired:
-        # Re-read fleet_a in case it was mutated (it wasn't — side_a fires onto B)
         report_b = await _resolve_side(
             attacker_fleet=fleet_b, defender_fleet=fleet_a, analysis=analysis.side_b,
         )
 
-    # Narratives (only for sides that fired), in parallel
-    narratives: dict[str, str] = {}
+    # Seiten-Narrative (nur für feuernde Seiten), parallel
+    narrative_a = ""
+    narrative_b = ""
     coros = []
     keys = []
     if report_a is not None:
         keys.append("a")
-        coros.append(ai.write_damage_report_text(
+        coros.append(ai.write_side_narrative(
             attacker_name=b.fleet_a_name, defender_name=b.fleet_b_name,
+            action_summary=analysis.side_a.action_summary,
             total_damage=report_a.total_damage,
-            modifier_percent=report_a.modifier_percent,
-            modifier_reason=report_a.modifier_reason,
             stack_damages=report_a.stack_damages,
         ))
     if report_b is not None:
         keys.append("b")
-        coros.append(ai.write_damage_report_text(
+        coros.append(ai.write_side_narrative(
             attacker_name=b.fleet_b_name, defender_name=b.fleet_a_name,
+            action_summary=analysis.side_b.action_summary,
             total_damage=report_b.total_damage,
-            modifier_percent=report_b.modifier_percent,
-            modifier_reason=report_b.modifier_reason,
             stack_damages=report_b.stack_damages,
         ))
     if coros:
         try:
             results = await asyncio.gather(*coros)
-            for k, v in zip(keys, results):
-                narratives[k] = v
+            by_key = dict(zip(keys, results))
+            narrative_a = by_key.get("a", "")
+            narrative_b = by_key.get("b", "")
         except Exception:
             log.exception("Narrative-Phase fehlgeschlagen")
-            for k in keys:
-                narratives[k] = "(Funkverbindung zur KI unterbrochen — nur Rohdaten verfügbar.)"
 
     fleet_a_after = await battle.get_fleet(b.guild_id, b.fleet_a_name, channel_id=b.channel_id)
     fleet_b_after = await battle.get_fleet(b.guild_id, b.fleet_b_name, channel_id=b.channel_id)
 
-    embeds: list[discord.Embed] = []
-    if report_a is not None:
-        embeds.append(_damage_embed(
-            b.fleet_a_name, b.fleet_b_name, report_a, narratives["a"], fleet_b_after,
-        ))
-    if report_b is not None:
-        embeds.append(_damage_embed(
-            b.fleet_b_name, b.fleet_a_name, report_b, narratives["b"], fleet_a_after,
-        ))
+    faction_a = await battle.get_fleet_faction(b.guild_id, b.fleet_a_name)
+    faction_b = await battle.get_fleet_faction(b.guild_id, b.fleet_b_name)
 
-    if analysis.side_a.fired != analysis.side_b.fired:
-        non_firing = b.fleet_b_name if not analysis.side_b.fired else b.fleet_a_name
-        note_embed = discord.Embed(
-            title=f"{non_firing} hat in diesem Fenster nicht gefeuert",
-            description="Daher kein Rückangriff. Für die nächste Runde einfach weiterschreiben.",
-            color=EMBED_COLOR_DEFAULT,
-        )
-        embeds.append(note_embed)
-
-    sent = await inter.followup.send(embeds=embeds, wait=True)
+    embed = _combined_report_embed(
+        round_number=round_number,
+        scene=analysis.scene,
+        fleet_a_name=b.fleet_a_name, fleet_b_name=b.fleet_b_name,
+        faction_a=faction_a, faction_b=faction_b,
+        analysis=analysis,
+        report_a=report_a, report_b=report_b,
+        narrative_a=narrative_a, narrative_b=narrative_b,
+        fleet_a_after=fleet_a_after, fleet_b_after=fleet_b_after,
+    )
+    sent = await inter.followup.send(embed=embed, wait=True)
 
     # Advance the resolve cursor (not the anchor — the anchor stays fixed as
     # the start-of-battle boundary, so earlier RP remains available as context).
@@ -854,7 +915,7 @@ async def help_cmd(inter: discord.Interaction) -> None:
     embed.add_field(
         name="Flotten (Admin, außer show/list)",
         value=(
-            "`/fleet add <fleet> <schiff> <anzahl>`\n"
+            "`/fleet add <fleet> <schiff> <anzahl> [fraktion]`\n"
             "`/fleet remove <fleet> <schiff> <anzahl>`\n"
             "`/fleet clear <fleet>`\n"
             "`/fleet show <fleet>` — jeder kann\n"

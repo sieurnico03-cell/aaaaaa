@@ -30,7 +30,6 @@ from .battle import FleetStack
 ANALYSIS_MODEL = "gemini-2.5-flash"
 NARRATIVE_MODEL = "gemini-2.5-flash"
 REQUEST_TIMEOUT_MS = 30_000
-MAX_MODIFIER = 25
 
 # Retry policy for transient server errors (5xx, UNAVAILABLE, DEADLINE_EXCEEDED).
 RETRY_ATTEMPTS = 4               # total tries including the first
@@ -100,14 +99,14 @@ def client() -> genai.Client:
 class SideAnalysis:
     fired: bool
     targeted_ships: list[str]
-    modifier_percent: int
-    modifier_reason: str
+    action_summary: str   # kurze, erzählerische Beschreibung dessen, was diese Seite tut
 
 
 @dataclass
 class WindowAnalysis:
     side_a: SideAnalysis
     side_b: SideAnalysis
+    scene: str          # kurze szenische Beschreibung beider Flotten (1-2 Sätze)
     overall_note: str   # empty if combat resolved normally
 
 
@@ -121,8 +120,9 @@ def _fleet_summary(stacks: list[FleetStack]) -> str:
 
 def _fallback(valid_a: list[str], valid_b: list[str], note: str) -> WindowAnalysis:
     return WindowAnalysis(
-        side_a=SideAnalysis(False, [], 0, "Analyse fehlgeschlagen"),
-        side_b=SideAnalysis(False, [], 0, "Analyse fehlgeschlagen"),
+        side_a=SideAnalysis(False, [], ""),
+        side_b=SideAnalysis(False, [], ""),
+        scene="",
         overall_note=note,
     )
 
@@ -145,13 +145,14 @@ async def analyze_battle_window(
     new_text = _fmt(new_transcript)
 
     system = (
-        "Du bist ein Taktikanalyst für ein Star Wars-Weltraumkampf-RPG auf Deutsch. "
+        "Du bist ein Taktik- und Erzähl-Analyst für ein Star Wars-Weltraumkampf-RPG auf Deutsch. "
         "Du bekommst zwei Transkript-Blöcke zweier Parteien "
         f"(Seite A = '{name_a}', Seite B = '{name_b}') sowie beide Flotten. "
         "Der VORHERIGE KAMPFVERLAUF ist nur Hintergrund für narrative Kohärenz – er wurde bereits "
         "abgerechnet und darf NICHT erneut Schaden verursachen. "
         "Die NEUEN RP-POSTS sind das aktuelle Fenster: entscheide pro Seite, ob dort tatsächlich "
-        "geschossen/angegriffen wird, und falls ja: welche Ziele und welcher Taktik-Modifier. "
+        "geschossen/angegriffen wird, und falls ja: welche Ziele. "
+        "Taktik-Modifier gibt es NICHT – es zählt allein der Roh-Schaden der feuernden Schiffe. "
         "Wichtig: Die wörtliche Formulierung 'eröffnet das Feuer' ist NIEMALS erforderlich. "
         "JEDE konkrete Beschreibung von Waffeneinsatz, Beschuss, Torpedos/Raketen/Bomben im Anflug, "
         "Treffern, Einschlägen, brechenden Schilden oder detonierenden Rümpfen gilt als aktives Feuer. "
@@ -160,6 +161,8 @@ async def analyze_battle_window(
         "solche Formulierungen ZÄHLEN als aktiver Waffeneinsatz, sobald konkrete Waffensysteme "
         "konkreten Zielschiffen zugeordnet sind. Lies zwischen den Zeilen — wenn der Post beschreibt, "
         "wie/wogegen die Flotte kämpft, dann kämpft sie. "
+        "Liefere außerdem eine kurze, erzählerische Szenenbeschreibung beider Flotten in 1-2 Sätzen, "
+        "und pro Seite einen kurzen Aktionssatz, was sie in diesem Fenster tut. "
         "Antworte IMMER mit einem einzelnen JSON-Objekt ohne zusätzlichen Text."
     )
 
@@ -181,17 +184,16 @@ FLOTTE SEITE B — {name_b}:
 
 Antwortschema:
 {{
+  "scene": "1-2 kurze, erzählerische deutsche Sätze, was beide Flotten in diesem Moment gerade tun (bildlich, ohne Wertung)",
   "side_a": {{
     "fired": <true|false>,
     "targeted_ships": ["exakter Schiffsklassen-Name aus Flotte B", ...],
-    "modifier_percent": <ganze Zahl zwischen -{MAX_MODIFIER} und +{MAX_MODIFIER}>,
-    "modifier_reason": "kurzer deutscher Satz"
+    "action_summary": "ein kurzer deutscher Satz: was tut {name_a} in diesem Fenster?"
   }},
   "side_b": {{
     "fired": <true|false>,
     "targeted_ships": ["exakter Schiffsklassen-Name aus Flotte A", ...],
-    "modifier_percent": <ganze Zahl>,
-    "modifier_reason": "kurzer deutscher Satz"
+    "action_summary": "ein kurzer deutscher Satz: was tut {name_b} in diesem Fenster?"
   }},
   "overall_note": "leer, ODER kurzer deutscher Hinweis falls z.B. gar kein Feuergefecht stattfand"
 }}
@@ -205,11 +207,10 @@ Regeln:
 - Reine Zielvorgaben/Zielformulierungen ('Ziel: Zerstörung des Führungsschiffs') ohne konkrete Waffenzuordnung sind alleine KEIN Feuer.
 - Wenn eine Seite im aktuellen Fenster nachweislich flieht / zurückzieht / abbricht, ohne zu schießen, dann ist "fired" = false für diese Seite.
 - Wenn schon in einem früheren Fenster gefeuert wurde, aber im aktuellen Fenster nur manövriert wird, dann ist "fired" = false für dieses Fenster.
-- Wenn "fired" = false ist, dürfen "targeted_ships" leer und modifier 0 sein.
+- Wenn "fired" = false ist, dürfen "targeted_ships" leer sein. action_summary beschreibt dann, was die Seite stattdessen tut (Anflug, Rückzug, Stellung halten ...).
 - targeted_ships MÜSSEN exakt aus der gegnerischen Flottenliste stammen (Copy&Paste).
 - Wenn gefeuert wird, aber kein konkretes Ziel genannt ist: wähle das plausibelste (Flaggschiff / größte Bedrohung).
-- Modifier-Bonus für: Flankenangriff, Ambush, Schwachpunkt-Ausnutzung, gute Formation, überraschendes Manöver.
-- Modifier-Malus für: frontaler Ansturm auf Kapitalschiffe, schlechte Positionierung, vorhersehbare Taktik.
+- scene ist IMMER gefüllt — 1-2 knappe, bildliche deutsche Sätze im Präsens, die beide Flotten gleichzeitig zeigen (z.B. 'Die Venatoren der Republik brechen nach Backbord auseinander, während die Munificent-Fregatten der KUS ihre Langstreckenbatterien in Position bringen.'). Keine Wertung, kein Kitsch.
 - overall_note ist "" wenn beide Seiten gefeuert haben. Falls keine Seite gefeuert hat, schreib dort eine kurze Feststellung wie 'Beide Flotten befinden sich noch im Anflug' oder 'Angreifer bricht ab und zieht sich zurück'.
 """
 
@@ -243,28 +244,19 @@ Regeln:
         targets = [t for t in raw_targets if isinstance(t, str) and t in valid_targets]
         if fired and not targets and valid_targets:
             targets = [valid_targets[0]]
-        mod = int(block.get("modifier_percent", 0) or 0)
-        mod = max(-MAX_MODIFIER, min(MAX_MODIFIER, mod))
-        reason = str(block.get("modifier_reason", ""))[:280]
-        return SideAnalysis(fired=fired, targeted_ships=targets,
-                            modifier_percent=mod, modifier_reason=reason)
+        action = str(block.get("action_summary", ""))[:400]
+        return SideAnalysis(fired=fired, targeted_ships=targets, action_summary=action)
 
     side_a = parse_side(data.get("side_a") or {}, valid_b)
     side_b = parse_side(data.get("side_b") or {}, valid_a)
+    scene = str(data.get("scene", ""))[:600]
     note = str(data.get("overall_note", ""))[:400]
 
-    return WindowAnalysis(side_a=side_a, side_b=side_b, overall_note=note)
+    return WindowAnalysis(side_a=side_a, side_b=side_b, scene=scene, overall_note=note)
 
 
-async def write_damage_report_text(
-    attacker_name: str,
-    defender_name: str,
-    total_damage: int,
-    modifier_percent: int,
-    modifier_reason: str,
-    stack_damages: list,
-) -> str:
-    damage_lines = []
+def _fmt_damage_lines(stack_damages: list) -> str:
+    lines = []
     for sd in stack_damages:
         parts = []
         if sd.shields_lost:
@@ -273,25 +265,36 @@ async def write_damage_report_text(
             parts.append(f"{sd.hull_lost} RU Hüllenschaden")
         if sd.ships_destroyed:
             parts.append(f"{sd.ships_destroyed}× zerstört")
-        damage_lines.append(f"- {sd.ship_name}: {', '.join(parts) if parts else 'keine Wirkung'}")
+        lines.append(f"- {sd.ship_name}: {', '.join(parts) if parts else 'keine Wirkung'}")
+    return "\n".join(lines) if lines else "- (keine nennenswerten Treffer)"
 
-    user = f"""Du bist der KI-Kampfanalyst eines Star Wars-Weltraumkampf-RPGs. Schreibe einen kurzen, atmosphärischen Schadensbericht (3-4 Sätze, IC auf Deutsch) im Stil eines militärischen Lagemelders.
 
-Angreifer: {attacker_name}
-Verteidiger: {defender_name}
-Taktik-Modifier: {modifier_percent:+d}% ({modifier_reason})
-Effektiver Gesamtschaden: {total_damage}
+async def write_side_narrative(
+    *,
+    attacker_name: str,
+    defender_name: str,
+    action_summary: str,
+    total_damage: int,
+    stack_damages: list,
+) -> str:
+    """Erzählerischer 2-3-Satz-Block für EINE angreifende Seite. Keine Modifier mehr."""
+    damage_lines = _fmt_damage_lines(stack_damages)
 
-Getroffene Ziele:
-{chr(10).join(damage_lines)}
+    user = f"""Schreibe 2-3 kurze deutsche Sätze, die beschreiben, wie die Flotte '{attacker_name}' ihren Angriff auf '{defender_name}' durchführt und was dabei passiert. Militärischer Lagemelder-Stil, kein Kitsch, keine Überschrift.
 
-Schreibe nur den Bericht selbst, keine Einleitung, keine Überschriften. Nutze militärischen Funkverkehr-Stil."""
+Aktion der Seite: {action_summary or '(keine Beschreibung — leite aus den Treffern ab)'}
+Gesamtschaden: {total_damage}
+
+Treffer:
+{damage_lines}
+
+Nur den Bericht, keine Einleitung."""
 
     t0 = time.perf_counter()
     response = await _generate_with_retry(
         model=NARRATIVE_MODEL,
         contents=user,
-        config=types.GenerateContentConfig(max_output_tokens=400),
+        config=types.GenerateContentConfig(max_output_tokens=300),
     )
-    log.info("write_damage_report_text: %.2fs (model=%s)", time.perf_counter() - t0, NARRATIVE_MODEL)
+    log.info("write_side_narrative: %.2fs", time.perf_counter() - t0)
     return (response.text or "").strip()

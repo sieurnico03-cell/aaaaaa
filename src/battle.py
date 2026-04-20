@@ -38,6 +38,13 @@ CREATE TABLE IF NOT EXISTS fleets (
     hull_current    INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS fleet_meta (
+    guild_id    INTEGER NOT NULL,
+    fleet_name  TEXT NOT NULL,
+    faction     TEXT,                 -- 'Republik' oder 'KUS'
+    PRIMARY KEY (guild_id, fleet_name)
+);
+
 CREATE TABLE IF NOT EXISTS battles (
     channel_id         INTEGER PRIMARY KEY,
     guild_id           INTEGER NOT NULL,
@@ -217,8 +224,36 @@ async def clear_fleet(
                  AND (scope_channel IS ? OR scope_channel = ?)""",
             (guild_id, fleet_name, channel_id, channel_id),
         )
+        # Drop the faction entry only when the persistent fleet is wiped.
+        if channel_id is None:
+            await db.execute(
+                "DELETE FROM fleet_meta WHERE guild_id = ? AND fleet_name = ?",
+                (guild_id, fleet_name),
+            )
         await db.commit()
         return cur.rowcount
+
+
+async def set_fleet_faction(guild_id: int, fleet_name: str, faction: str) -> None:
+    """Store/overwrite the faction label for a fleet ('Republik' or 'KUS')."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """INSERT INTO fleet_meta (guild_id, fleet_name, faction)
+               VALUES (?, ?, ?)
+               ON CONFLICT(guild_id, fleet_name) DO UPDATE SET faction = excluded.faction""",
+            (guild_id, fleet_name, faction),
+        )
+        await db.commit()
+
+
+async def get_fleet_faction(guild_id: int, fleet_name: str) -> str | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        row = await (await db.execute(
+            "SELECT faction FROM fleet_meta WHERE guild_id = ? AND fleet_name = ?",
+            (guild_id, fleet_name),
+        )).fetchone()
+    return row["faction"] if row and row["faction"] else None
 
 
 async def get_fleet(

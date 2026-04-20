@@ -8,6 +8,7 @@ from difflib import get_close_matches
 from pathlib import Path
 
 DATA_PATH = Path(__file__).resolve().parent.parent / "data" / "ships.json"
+IMAGES_PATH = Path(__file__).resolve().parent.parent / "data" / "ship_images.json"
 
 
 @dataclass(frozen=True)
@@ -26,6 +27,7 @@ class Ship:
     secondary_weapons: str
     hangar_description: str
     notes: str
+    image_url: str | None = None
 
     @property
     def total_hp(self) -> int:
@@ -38,10 +40,33 @@ def _normalize(text: str) -> str:
     return text.lower().strip()
 
 
-class ShipDatabase:
-    def __init__(self, path: Path = DATA_PATH) -> None:
+def _load_image_map(path: Path) -> dict[str, str]:
+    """Mapping Schiffsname → Bild-URL. Fehlende Datei ist okay."""
+    if not path.exists():
+        return {}
+    try:
         raw = json.loads(path.read_text(encoding="utf-8"))
-        self._ships: list[Ship] = [Ship(**entry) for entry in raw]
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return {_normalize(k): v for k, v in raw.items() if isinstance(v, str) and v.strip()}
+
+
+class ShipDatabase:
+    def __init__(
+        self,
+        path: Path = DATA_PATH,
+        images_path: Path = IMAGES_PATH,
+    ) -> None:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        image_map = _load_image_map(images_path)
+        ships: list[Ship] = []
+        for entry in raw:
+            # tolerate older ships.json without image_url
+            entry.setdefault("image_url", None)
+            if not entry["image_url"]:
+                entry["image_url"] = image_map.get(_normalize(entry["name"]))
+            ships.append(Ship(**entry))
+        self._ships = ships
         self._by_norm: dict[str, Ship] = {_normalize(s.name): s for s in self._ships}
 
     def all(self) -> list[Ship]:

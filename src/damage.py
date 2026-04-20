@@ -2,10 +2,9 @@
 
 A resolved round produces a structured DamageReport for each side.
 The caller decides:
-  - Total outgoing damage (summed from the attacker's live ships, possibly
-    with modifiers from the RP text analysis).
+  - Total outgoing damage (summed from the attacker's live ships).
   - Which stacks are targeted (from the player's RP post — extracted by the
-    Claude API in ai.py).
+    Gemini API in ai.py).
 
 Damage is applied sequentially: each hit first eats shields, then hull.
 When a lead ship's hull hits 0, the stack loses one ship and shields/hull
@@ -40,8 +39,6 @@ class DamageReport:
     attacker_id: int
     defender_id: int
     total_damage: int
-    modifier_reason: str = ""
-    modifier_percent: int = 0      # e.g. +10 for flanking bonus, -20 for poor tactics
     stack_damages: list[StackDamage] = field(default_factory=list)
     unassigned_damage: int = 0     # damage that had no valid target left
 
@@ -58,10 +55,6 @@ def compute_outgoing_damage(stacks: list[FleetStack]) -> int:
             continue
         total += stack.ship.damage_per_report * stack.count
     return int(total)
-
-
-def apply_modifier(base: int, modifier_percent: int) -> int:
-    return max(0, int(round(base * (1 + modifier_percent / 100))))
 
 
 def _destroy_one_and_reset(stack: FleetStack) -> None:
