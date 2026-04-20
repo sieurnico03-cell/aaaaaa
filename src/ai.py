@@ -15,6 +15,7 @@ Two distinct tasks:
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -31,7 +32,53 @@ NARRATIVE_MODEL = "gemini-2.5-flash"
 REQUEST_TIMEOUT_MS = 30_000
 MAX_MODIFIER = 25
 
+# Retry policy for transient server errors (5xx, UNAVAILABLE, DEADLINE_EXCEEDED).
+RETRY_ATTEMPTS = 4               # total tries including the first
+RETRY_BACKOFF_SECONDS = (2, 5, 10)   # wait times between attempts 1→2, 2→3, 3→4
+
 log = logging.getLogger("sw-rpg-bot.ai")
+
+
+def _is_transient_error(exc: BaseException) -> bool:
+    """Detect Gemini server-side overload / transient failure.
+    Covers 5xx responses and RPC statuses like UNAVAILABLE / DEADLINE_EXCEEDED."""
+    msg = f"{type(exc).__name__} {exc}".upper()
+    markers = (
+        "503", "UNAVAILABLE",
+        "500", "INTERNAL",
+        "504", "DEADLINE_EXCEEDED",
+        "502", "BAD_GATEWAY",
+        "429", "RESOURCE_EXHAUSTED",
+    )
+    return any(m in msg for m in markers)
+
+
+async def _generate_with_retry(
+    *,
+    model: str,
+    contents: str,
+    config: types.GenerateContentConfig,
+):
+    """Call Gemini, retrying on transient server errors with backoff."""
+    last_exc: BaseException | None = None
+    for attempt in range(RETRY_ATTEMPTS):
+        try:
+            return await client().aio.models.generate_content(
+                model=model, contents=contents, config=config,
+            )
+        except Exception as e:
+            last_exc = e
+            if not _is_transient_error(e) or attempt == RETRY_ATTEMPTS - 1:
+                raise
+            delay = RETRY_BACKOFF_SECONDS[min(attempt, len(RETRY_BACKOFF_SECONDS) - 1)]
+            log.warning(
+                "Gemini transient error (attempt %d/%d): %s — retry in %ds",
+                attempt + 1, RETRY_ATTEMPTS, type(e).__name__, delay,
+            )
+            await asyncio.sleep(delay)
+    # Unreachable — the loop either returns or raises — but keeps type-checkers happy.
+    assert last_exc is not None
+    raise last_exc
 
 _client: genai.Client | None = None
 
@@ -168,7 +215,7 @@ Regeln:
 
     t0 = time.perf_counter()
     try:
-        response = await client().aio.models.generate_content(
+        response = await _generate_with_retry(
             model=ANALYSIS_MODEL,
             contents=user,
             config=types.GenerateContentConfig(
@@ -241,7 +288,7 @@ Getroffene Ziele:
 Schreibe nur den Bericht selbst, keine Einleitung, keine Überschriften. Nutze militärischen Funkverkehr-Stil."""
 
     t0 = time.perf_counter()
-    response = await client().aio.models.generate_content(
+    response = await _generate_with_retry(
         model=NARRATIVE_MODEL,
         contents=user,
         config=types.GenerateContentConfig(max_output_tokens=400),
