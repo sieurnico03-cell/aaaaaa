@@ -10,6 +10,11 @@ The caller decides:
 Damage is applied sequentially: each hit first eats shields, then hull.
 When a lead ship's hull hits 0, the stack loses one ship and shields/hull
 reset to the class maximum for the next.
+
+Round semantics: one `/battle resolve` = ein Schadensbericht. In einem
+Schadensbericht schreibt jede Seite genau eine RP-Nachricht, und der
+`damage_per_report`-Wert aus der Schiffstabelle ist der Schaden, den
+diese eine Seite in ihrer Nachricht austeilt.
 """
 from __future__ import annotations
 
@@ -42,7 +47,11 @@ class DamageReport:
 
 
 def compute_outgoing_damage(stacks: list[FleetStack]) -> int:
-    """Sum the 'damage per report' of all living ships in every stack."""
+    """Sum the 'damage per report' of all living ships in every stack.
+
+    `damage_per_report` ist der Schaden, den ein Schiff in EINER RP-Nachricht
+    austeilt (d.h. in einem Schadensbericht pro Seite). Keine Halbierung.
+    """
     total = 0.0
     for stack in stacks:
         if not stack.is_alive:
