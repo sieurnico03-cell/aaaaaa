@@ -122,7 +122,10 @@ def _parse_csv(path: Path, faction: str) -> list[dict]:
         dpf = _extract_stat(grunddaten, "DPF") or 0
 
         hangar = _extract_hangar(row[4])
-        damage_raw = row[8].strip()
+        # Spalte 6 ("Schaden bei opt. Feuerwinkel") ist laut Sheet-Autor der
+        # maßgebliche Schaden-pro-Schadensbericht-Wert. Spalte 8
+        # ("Damage pro Schadensbericht") ist im Export teilweise abweichend.
+        damage_raw = row[6].strip()
         damage = _num(damage_raw) or 0
 
         ship = {
