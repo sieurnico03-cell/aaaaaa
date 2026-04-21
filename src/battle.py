@@ -45,6 +45,11 @@ CREATE TABLE IF NOT EXISTS fleet_meta (
     PRIMARY KEY (guild_id, fleet_name)
 );
 
+CREATE TABLE IF NOT EXISTS ship_image_overrides (
+    ship_name  TEXT PRIMARY KEY,
+    file_name  TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS battles (
     channel_id         INTEGER PRIMARY KEY,
     guild_id           INTEGER NOT NULL,
@@ -254,6 +259,48 @@ async def get_fleet_faction(guild_id: int, fleet_name: str) -> str | None:
             (guild_id, fleet_name),
         )).fetchone()
     return row["faction"] if row and row["faction"] else None
+
+
+# --- Ship image overrides ----------------------------------------------------
+
+SHIP_IMAGES_DIR = DATA_DIR / "ship_images"
+
+
+async def set_ship_image_override(ship_name: str, file_name: str) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """INSERT INTO ship_image_overrides (ship_name, file_name)
+               VALUES (?, ?)
+               ON CONFLICT(ship_name) DO UPDATE SET file_name = excluded.file_name""",
+            (ship_name, file_name),
+        )
+        await db.commit()
+
+
+async def get_ship_image_override(ship_name: str) -> str | None:
+    """Returns the filename (relative to SHIP_IMAGES_DIR) for a ship, or None."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        row = await (await db.execute(
+            "SELECT file_name FROM ship_image_overrides WHERE ship_name = ?",
+            (ship_name,),
+        )).fetchone()
+    return row["file_name"] if row else None
+
+
+async def clear_ship_image_override(ship_name: str) -> str | None:
+    """Removes the DB entry and returns the filename that was stored (for cleanup)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        row = await (await db.execute(
+            "SELECT file_name FROM ship_image_overrides WHERE ship_name = ?",
+            (ship_name,),
+        )).fetchone()
+        if row is None:
+            return None
+        await db.execute("DELETE FROM ship_image_overrides WHERE ship_name = ?", (ship_name,))
+        await db.commit()
+    return row["file_name"]
 
 
 async def get_fleet(

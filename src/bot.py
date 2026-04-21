@@ -194,8 +194,18 @@ async def ship_info(inter: discord.Interaction, name: str) -> None:
         description=f"_{ship.faction} · {ship.category}_",
         color=FACTION_COLOR.get(ship.faction, EMBED_COLOR_DEFAULT),
     )
-    if ship.image_url:
+
+    # Bild: erst lokaler Upload (via /ship set_image), dann URL aus ships.json
+    file_to_send: discord.File | None = None
+    override_name = await battle.get_ship_image_override(ship.name)
+    if override_name:
+        path = battle.SHIP_IMAGES_DIR / override_name
+        if path.exists():
+            file_to_send = discord.File(str(path), filename=override_name)
+            embed.set_image(url=f"attachment://{override_name}")
+    if file_to_send is None and ship.image_url:
         embed.set_image(url=ship.image_url)
+
     embed.add_field(name="Schilde (SBD)", value=f"**{_fmt_int(ship.shields)}**", inline=True)
     embed.add_field(name="Hülle (RU)", value=f"**{_fmt_int(ship.hull)}**", inline=True)
     embed.add_field(name="Damage/Runde", value=f"**{ship.damage_per_report:g}**", inline=True)
@@ -212,7 +222,93 @@ async def ship_info(inter: discord.Interaction, name: str) -> None:
         embed.add_field(name="Sekundärbewaffnung", value=ship.secondary_weapons[:1024], inline=False)
     if ship.notes:
         embed.add_field(name="Notizen", value=ship.notes[:1024], inline=False)
-    await inter.response.send_message(embed=embed)
+    if file_to_send is not None:
+        await inter.response.send_message(embed=embed, file=file_to_send)
+    else:
+        await inter.response.send_message(embed=embed)
+
+
+@ship_group.command(name="set_image", description="Bild für eine Schiffsklasse hinterlegen (Admin)")
+@app_commands.describe(name="Schiffsklasse", image="Bilddatei (PNG/JPG/WEBP/GIF)")
+@app_commands.autocomplete(name=_ship_name_autocomplete)
+async def ship_set_image(
+    inter: discord.Interaction,
+    name: str,
+    image: discord.Attachment,
+) -> None:
+    if not _is_admin(inter):
+        await inter.response.send_message("Nur Admins dürfen Bilder setzen.", ephemeral=True)
+        return
+    ship = SHIPS.get(name)
+    if ship is None:
+        await inter.response.send_message(f"Unbekannte Schiffsklasse: `{name}`", ephemeral=True)
+        return
+
+    ct = (image.content_type or "").lower()
+    if not ct.startswith("image/"):
+        await inter.response.send_message(
+            f"Das hochgeladene File ist kein Bild (Content-Type: `{ct or 'unbekannt'}`).",
+            ephemeral=True,
+        )
+        return
+
+    # Extension aus dem Dateinamen ableiten, sonst aus Content-Type.
+    ext = ""
+    if "." in image.filename:
+        ext = "." + image.filename.rsplit(".", 1)[-1].lower()
+    if ext not in {".png", ".jpg", ".jpeg", ".webp", ".gif"}:
+        ct_to_ext = {
+            "image/png": ".png", "image/jpeg": ".jpg",
+            "image/webp": ".webp", "image/gif": ".gif",
+        }
+        ext = ct_to_ext.get(ct, ".png")
+
+    # Stabiler Dateiname pro Schiff (sanitize).
+    safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in ship.name)
+    file_name = f"{safe}{ext}"
+
+    await inter.response.defer(ephemeral=True)
+    battle.SHIP_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+    dest = battle.SHIP_IMAGES_DIR / file_name
+
+    # Alte Varianten mit anderer Extension entfernen.
+    for old in battle.SHIP_IMAGES_DIR.glob(f"{safe}.*"):
+        if old.name != file_name:
+            try:
+                old.unlink()
+            except OSError:
+                pass
+
+    await image.save(dest)
+    await battle.set_ship_image_override(ship.name, file_name)
+    await inter.followup.send(
+        f"Bild für **{ship.name}** gespeichert ({image.size // 1024} KB).",
+        ephemeral=True,
+    )
+
+
+@ship_group.command(name="clear_image", description="Bild-Override für eine Schiffsklasse entfernen (Admin)")
+@app_commands.describe(name="Schiffsklasse")
+@app_commands.autocomplete(name=_ship_name_autocomplete)
+async def ship_clear_image(inter: discord.Interaction, name: str) -> None:
+    if not _is_admin(inter):
+        await inter.response.send_message("Nur Admins dürfen Bilder entfernen.", ephemeral=True)
+        return
+    ship = SHIPS.get(name)
+    if ship is None:
+        await inter.response.send_message(f"Unbekannte Schiffsklasse: `{name}`", ephemeral=True)
+        return
+    old = await battle.clear_ship_image_override(ship.name)
+    if old is None:
+        await inter.response.send_message(f"Kein Override für **{ship.name}** gesetzt.", ephemeral=True)
+        return
+    path = battle.SHIP_IMAGES_DIR / old
+    if path.exists():
+        try:
+            path.unlink()
+        except OSError:
+            pass
+    await inter.response.send_message(f"Bild-Override für **{ship.name}** entfernt.", ephemeral=True)
 
 
 @ship_group.command(name="search", description="Schiffe suchen")
