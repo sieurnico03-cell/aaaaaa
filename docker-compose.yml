@@ -1,0 +1,11 @@
+services:
+  bot:
+    build: .
+    image: sw-rpg-bot:latest
+    container_name: sw-rpg-bot
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATA_DIR: /data
+    volumes:
+      - ./bot-data:/data
